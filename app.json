@@ -75,7 +75,6 @@
           "microphonePermission": false
         }
       ],
-      "./plugins/navigation-sdk-plugin",
       [
         "expo-build-properties",
         {
