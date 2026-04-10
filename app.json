@@ -22,7 +22,8 @@
         "UIBackgroundModes": [
           "audio",
           "location"
-        ]
+        ],
+        "ITSAppUsesNonExemptEncryption": false
       },
       "config": {
         "googleMapsApiKey": "AIzaSyDwdyLAWuYc6WacRQpgtPI06wxXLofg3VI"
@@ -74,7 +75,15 @@
           "microphonePermission": false
         }
       ],
-      "./plugins/navigation-sdk-plugin"
+      "./plugins/navigation-sdk-plugin",
+      [
+        "expo-build-properties",
+        {
+          "ios": {
+            "deploymentTarget": "16.0"
+          }
+        }
+      ]
     ],
     "extra": {
       "router": {},
