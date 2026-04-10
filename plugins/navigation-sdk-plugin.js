@@ -1,4 +1,6 @@
-const { withAppBuildGradle, withAndroidManifest } = require("expo/config-plugins");
+const { withAppBuildGradle, withAndroidManifest, withDangerousMod } = require("expo/config-plugins");
+const fs = require("fs");
+const path = require("path");
 
 function withNavigationSDK(config) {
   config = withAppBuildGradle(config, (config) => {
@@ -69,6 +71,39 @@ function withNavigationSDK(config) {
 
     return config;
   });
+
+  // Copy marker images to Android assets folder
+  config = withDangerousMod(config, [
+    "android",
+    async (config) => {
+      const projectRoot = config.modRequest.projectRoot;
+      const assetsDir = path.join(
+        config.modRequest.platformProjectRoot,
+        "app",
+        "src",
+        "main",
+        "assets",
+        "markers"
+      );
+
+      // Create markers directory
+      fs.mkdirSync(assetsDir, { recursive: true });
+
+      // Copy all marker PNGs
+      const markersSource = path.join(projectRoot, "assets", "markers");
+      if (fs.existsSync(markersSource)) {
+        const files = fs.readdirSync(markersSource).filter((f) => f.endsWith(".png"));
+        for (const file of files) {
+          fs.copyFileSync(
+            path.join(markersSource, file),
+            path.join(assetsDir, file)
+          );
+        }
+      }
+
+      return config;
+    },
+  ]);
 
   return config;
 }

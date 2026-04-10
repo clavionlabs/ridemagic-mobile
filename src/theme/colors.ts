@@ -1,7 +1,8 @@
 export const colors = {
   // Primary
-  rideBlue: "#2563EB",
-  magicGreen: "#10B981",
+  rideBlue: "#0078FF",
+  magicGreen: "#00E89D",
+  mysticPurple: "#7C5CFC",
 
   // Neutrals
   nearBlack: "#1A1816",
@@ -16,8 +17,8 @@ export const colors = {
   errorRed: "#EF4444",
 
   // Gradient
-  gradientStart: "#7C3AED", // purple
-  gradientEnd: "#10B981",   // green
+  gradientStart: "#7C5CFC", // mystic purple
+  gradientEnd: "#00E89D",   // magic green
 
   // Dark mode overrides
   dark: {
