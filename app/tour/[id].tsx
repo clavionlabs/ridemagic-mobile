@@ -533,7 +533,7 @@ export default function TourScreen() {
       )}
 
       {/* Bottom panel */}
-      <View style={[styles.bottomPanel, { backgroundColor: isDark ? colors.nearBlack : "#fff" }]}>
+      <View style={[styles.bottomPanel, { backgroundColor: isDark ? colors.nearBlack : "#fff", paddingBottom: insets.bottom + 16 }]}>
         {/* POI chips */}
         <ScrollView
           horizontal
@@ -604,8 +604,8 @@ export default function TourScreen() {
         <View style={styles.controls}>
           <TouchableOpacity style={styles.controlButton}>
             <View style={styles.skipIcon}>
-              <View style={[styles.skipTriangle, { borderRightColor: theme.text, transform: [{ rotate: "180deg" }] }]} />
               <View style={[styles.skipBar, { backgroundColor: theme.text, marginRight: 2 }]} />
+              <View style={[styles.skipPrev, { borderRightColor: theme.text }]} />
             </View>
           </TouchableOpacity>
 
@@ -622,8 +622,8 @@ export default function TourScreen() {
 
           <TouchableOpacity style={styles.controlButton}>
             <View style={styles.skipIcon}>
+              <View style={[styles.skipNext, { borderLeftColor: theme.text }]} />
               <View style={[styles.skipBar, { backgroundColor: theme.text, marginLeft: 2 }]} />
-              <View style={[styles.skipTriangle, { borderRightColor: theme.text }]} />
             </View>
           </TouchableOpacity>
         </View>
@@ -759,12 +759,21 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
   },
-  skipTriangle: {
+  skipPrev: {
     width: 0,
     height: 0,
     borderTopWidth: 8,
     borderBottomWidth: 8,
     borderRightWidth: 12,
+    borderTopColor: "transparent",
+    borderBottomColor: "transparent",
+  },
+  skipNext: {
+    width: 0,
+    height: 0,
+    borderTopWidth: 8,
+    borderBottomWidth: 8,
+    borderLeftWidth: 12,
     borderTopColor: "transparent",
     borderBottomColor: "transparent",
   },

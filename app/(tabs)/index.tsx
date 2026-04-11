@@ -70,13 +70,14 @@ export default function HomeScreen() {
   const mapRef = useRef<MapView>(null);
   const insets = useSafeAreaInsets();
 
-  const [origin, setOrigin] = useState("");
+  const [origin, setOrigin] = useState("Current Location");
   const [destination, setDestination] = useState("");
   const [originInput, setOriginInput] = useState("");
   const [destInput, setDestInput] = useState("");
   const [originSuggestions, setOriginSuggestions] = useState<any[]>([]);
   const [destSuggestions, setDestSuggestions] = useState<any[]>([]);
   const [activeField, setActiveField] = useState<"origin" | "dest" | null>(null);
+  const [showOriginField, setShowOriginField] = useState(false);
   const [routeData, setRouteData] = useState<any>(null);
   const [pois, setPois] = useState<any[]>([]);
   const [loadingRoute, setLoadingRoute] = useState(false);
@@ -291,8 +292,8 @@ export default function HomeScreen() {
   }, [isDriving, drivingLocation, tourPois]);
 
   const handleGetDirections = async () => {
-    if (!origin.trim() || !destination.trim()) {
-      Alert.alert("Error", "Please enter both starting point and destination");
+    if (!destination.trim()) {
+      Alert.alert("Error", "Please enter a destination");
       return;
     }
 
@@ -302,8 +303,22 @@ export default function HomeScreen() {
     setTourReady(false);
     setRouteId(null);
 
+    // Resolve "Current Location" to actual address
+    let resolvedOrigin = origin;
+    if (origin === "Current Location" && userLoc) {
+      try {
+        const res = await fetch(
+          `https://maps.googleapis.com/maps/api/geocode/json?latlng=${userLoc.lat},${userLoc.lng}&key=${ENV.GOOGLE_MAPS_API_KEY}`
+        );
+        const data = await res.json();
+        if (data.results?.[0]?.formatted_address) {
+          resolvedOrigin = data.results[0].formatted_address;
+        }
+      } catch {}
+    }
+
     try {
-      const data = await api.getDirections(origin, destination);
+      const data = await api.getDirections(resolvedOrigin, destination);
       setRouteData(data);
 
       const poisData = await api.getPois(data.polyline, data.durationSec);
@@ -577,51 +592,81 @@ export default function HomeScreen() {
           <View style={styles.dragHandle} />
         </TouchableOpacity>
 
-          <Text style={[styles.title, { color: theme.text }]}>Plan Your Route</Text>
+          {/* Origin row — collapsed by default, shows "Current Location" */}
+          {showOriginField || routeData ? (
+            <>
+              <TouchableOpacity
+                style={[styles.originBar, { backgroundColor: isDark ? colors.charcoal : "#f0f0f0" }]}
+                onPress={() => {
+                  setShowOriginField(true);
+                  setActiveField("origin");
+                  setTimeout(() => originInputRef.current?.focus(), 100);
+                }}
+              >
+                <View style={[styles.dot, { backgroundColor: colors.magicGreen }]} />
+                {activeField === "origin" ? (
+                  <TextInput
+                    ref={originInputRef}
+                    style={[styles.input, { color: theme.text }]}
+                    placeholder="Starting point"
+                    placeholderTextColor={theme.textSecondary}
+                    value={originInput || (origin === "Current Location" ? "" : origin)}
+                    onChangeText={(text) => {
+                      setOriginInput(text);
+                      if (origin !== "Current Location") setOrigin("");
+                      if (routeData) {
+                        setRouteData(null); setPois([]); setTourReady(false); setRouteId(null);
+                      }
+                      fetchSuggestions(text, "origin");
+                    }}
+                    onFocus={() => setActiveField("origin")}
+                    onBlur={() => {}}
+                    autoFocus
+                  />
+                ) : (
+                  <Text style={[styles.originLabel, { color: origin === "Current Location" ? colors.rideBlue : theme.text }]}>
+                    {origin || "Current Location"}
+                  </Text>
+                )}
+              </TouchableOpacity>
 
-          {/* Origin input */}
-          <View style={[styles.inputRow, { borderColor: activeField === "origin" ? colors.rideBlue : theme.border }]}>
-            <View style={[styles.dot, { backgroundColor: colors.magicGreen }]} />
-            <TextInput
-              ref={originInputRef}
-              style={[styles.input, { color: theme.text }]}
-              placeholder="Starting point"
-              placeholderTextColor={theme.textSecondary}
-              value={originInput || origin}
-              onChangeText={(text) => {
-                setOriginInput(text);
-                if (origin) setOrigin("");
-                if (routeData) {
-                  setRouteData(null); setPois([]); setTourReady(false); setRouteId(null);
-                }
-                fetchSuggestions(text, "origin");
+              {/* Destination input */}
+              <View style={[styles.inputRow, { borderColor: activeField === "dest" ? colors.rideBlue : theme.border }]}>
+                <View style={[styles.dot, { backgroundColor: colors.rideBlue }]} />
+                <TextInput
+                  ref={destInputRef}
+                  style={[styles.input, { color: theme.text }]}
+                  placeholder="Destination"
+                  placeholderTextColor={theme.textSecondary}
+                  value={destInput || destination}
+                  onChangeText={(text) => {
+                    setDestInput(text);
+                    if (destination) setDestination("");
+                    if (routeData) {
+                      setRouteData(null); setPois([]); setTourReady(false); setRouteId(null);
+                    }
+                    fetchSuggestions(text, "dest");
+                  }}
+                  onFocus={() => { setActiveField("dest"); if (!panelOpen) togglePanel(true); }}
+                  onBlur={() => {}}
+                />
+              </View>
+            </>
+          ) : (
+            /* "Where to?" — single input, Uber-style */
+            <TouchableOpacity
+              style={[styles.whereToBar, { backgroundColor: isDark ? colors.charcoal : "#f0f0f0" }]}
+              onPress={() => {
+                setShowOriginField(true);
+                setActiveField("dest");
+                setTimeout(() => destInputRef.current?.focus(), 100);
               }}
-              onFocus={() => { setActiveField("origin"); if (!panelOpen) togglePanel(true); }}
-              onBlur={() => {}}
-            />
-          </View>
-
-          {/* Destination input */}
-          <View style={[styles.inputRow, { borderColor: activeField === "dest" ? colors.rideBlue : theme.border }]}>
-            <View style={[styles.dot, { backgroundColor: colors.rideBlue }]} />
-            <TextInput
-              ref={destInputRef}
-              style={[styles.input, { color: theme.text }]}
-              placeholder="Destination"
-              placeholderTextColor={theme.textSecondary}
-              value={destInput || destination}
-              onChangeText={(text) => {
-                setDestInput(text);
-                if (destination) setDestination("");
-                if (routeData) {
-                  setRouteData(null); setPois([]); setTourReady(false); setRouteId(null);
-                }
-                fetchSuggestions(text, "dest");
-              }}
-              onFocus={() => { setActiveField("dest"); if (!panelOpen) togglePanel(true); }}
-              onBlur={() => {}}
-            />
-          </View>
+              activeOpacity={0.7}
+            >
+              <Text style={[styles.whereToIcon, { color: colors.rideBlue }]}>◎</Text>
+              <Text style={[styles.whereToText, { color: theme.textSecondary }]}>Where to?</Text>
+            </TouchableOpacity>
+          )}
 
           {/* Suggestions list */}
           {activeField !== null && (
@@ -629,26 +674,13 @@ export default function HomeScreen() {
             (activeField === "dest" && destSuggestions.length > 0)
           ) && (
             <View style={[styles.suggestionsList, { backgroundColor: theme.surface, borderColor: theme.border }]}>
+              {/* "Use Current Location" option for origin field */}
               {activeField === "origin" && (
                 <TouchableOpacity
                   style={[styles.suggestionItem, styles.yourLocationItem]}
-                  onPress={async () => {
-                    const loc = userLoc || await (async () => {
-                      const l = await Location.getCurrentPositionAsync({});
-                      return { lat: l.coords.latitude, lng: l.coords.longitude };
-                    })();
-                    let label = "Current Location";
-                    try {
-                      const res = await fetch(
-                        `https://maps.googleapis.com/maps/api/geocode/json?latlng=${loc.lat},${loc.lng}&key=${ENV.GOOGLE_MAPS_API_KEY}`
-                      );
-                      const data = await res.json();
-                      if (data.results?.[0]?.formatted_address) {
-                        label = data.results[0].formatted_address;
-                      }
-                    } catch {}
-                    setOrigin(label);
-                    setOriginInput(label);
+                  onPress={() => {
+                    setOrigin("Current Location");
+                    setOriginInput("");
                     setOriginSuggestions([]);
                     setActiveField(null);
                     originInputRef.current?.blur();
@@ -658,7 +690,7 @@ export default function HomeScreen() {
                   <View style={styles.yourLocationIcon}>
                     <Text style={{ fontSize: 16 }}>◎</Text>
                   </View>
-                  <Text style={[styles.suggestionMain, { color: colors.rideBlue, fontWeight: "600" }]}>Your Location</Text>
+                  <Text style={[styles.suggestionMain, { color: colors.rideBlue, fontWeight: "600" }]}>Current Location</Text>
                 </TouchableOpacity>
               )}
 
@@ -770,10 +802,34 @@ const styles = StyleSheet.create({
     alignSelf: "center",
     marginBottom: spacing.md,
   },
-  title: {
+  whereToBar: {
+    flexDirection: "row",
+    alignItems: "center",
+    borderRadius: borderRadius.md,
+    paddingHorizontal: spacing.md,
+    paddingVertical: 14,
+    marginBottom: spacing.sm,
+  },
+  whereToIcon: {
+    fontSize: 18,
+    marginRight: spacing.sm,
+  },
+  whereToText: {
     fontSize: fontSize.lg,
-    fontWeight: "700",
-    marginBottom: spacing.md,
+    fontWeight: "600",
+  },
+  originBar: {
+    flexDirection: "row",
+    alignItems: "center",
+    borderRadius: borderRadius.md,
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.sm,
+    marginBottom: spacing.sm,
+  },
+  originLabel: {
+    fontSize: fontSize.md,
+    fontWeight: "500",
+    flex: 1,
   },
   inputRow: {
     flexDirection: "row",
