@@ -11,11 +11,12 @@ import {
 } from "react-native";
 import MapView, { Marker, Polyline, PROVIDER_GOOGLE } from "react-native-maps";
 import { useLocalSearchParams, useRouter } from "expo-router";
-import { SafeAreaView } from "react-native-safe-area-context";
+import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { Audio } from "expo-av";
 import * as Location from "expo-location";
 import { activateKeepAwakeAsync, deactivateKeepAwake } from "expo-keep-awake";
 import { colors, fontSize, spacing, borderRadius } from "../../src/theme";
+import { lightMapStyle, darkMapStyle } from "../../src/theme/mapStyles";
 import { markerImages } from "../../src/lib/markerAssets";
 import { useAuth } from "../../src/hooks/useAuth";
 import { supabase } from "../../src/lib/supabase";
@@ -93,22 +94,6 @@ const STATE_LABELS: Record<string, string> = {
 
 const TRIGGER_RADIUS_M = 150;
 
-const lightMapStyle = [
-  { featureType: "poi", elementType: "labels", stylers: [{ visibility: "off" }] },
-  { featureType: "poi.business", stylers: [{ visibility: "off" }] },
-  { featureType: "transit", elementType: "labels", stylers: [{ visibility: "off" }] },
-];
-
-const darkMapStyle = [
-  { elementType: "geometry", stylers: [{ color: "#1d2c4d" }] },
-  { elementType: "labels.text.fill", stylers: [{ color: "#8ec3b9" }] },
-  { elementType: "labels.text.stroke", stylers: [{ color: "#1a3646" }] },
-  { featureType: "poi", elementType: "labels", stylers: [{ visibility: "off" }] },
-  { featureType: "poi.business", stylers: [{ visibility: "off" }] },
-  { featureType: "transit", elementType: "labels", stylers: [{ visibility: "off" }] },
-  { featureType: "road", elementType: "geometry", stylers: [{ color: "#304a7d" }] },
-  { featureType: "water", elementType: "geometry", stylers: [{ color: "#0e1626" }] },
-];
 
 export default function TourScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
@@ -117,6 +102,7 @@ export default function TourScreen() {
   const router = useRouter();
   const { user } = useAuth();
   const mapRef = useRef<MapView>(null);
+  const insets = useSafeAreaInsets();
 
   // Data
   const [route, setRoute] = useState<RouteData | null>(null);
@@ -506,14 +492,20 @@ export default function TourScreen() {
           />
         )}
 
-        {/* POI markers */}
+        {/* POI markers — numbered circles with brand colors */}
         {visiblePois.map((poi, i) => (
           <Marker
             key={`poi-${poi.id}`}
             coordinate={{ latitude: poi.lat, longitude: poi.lng }}
             title={`${i + 1}. ${poi.name}`}
-            image={markerImages.poiBlue}
-          />
+          >
+            <View style={[styles.poiMarker, {
+              backgroundColor: isDark ? colors.mysticPurple : colors.rideBlue,
+              borderColor: isDark ? colors.nearBlack : "#fff",
+            }]}>
+              <Text style={styles.poiMarkerText}>{i + 1}</Text>
+            </View>
+          </Marker>
         ))}
 
         {/* User location in driving mode */}
@@ -611,15 +603,28 @@ export default function TourScreen() {
         {/* Controls */}
         <View style={styles.controls}>
           <TouchableOpacity style={styles.controlButton}>
-            <Text style={{ color: theme.text, fontSize: 24 }}>⏮</Text>
+            <View style={styles.skipIcon}>
+              <View style={[styles.skipTriangle, { borderRightColor: theme.text, transform: [{ rotate: "180deg" }] }]} />
+              <View style={[styles.skipBar, { backgroundColor: theme.text, marginRight: 2 }]} />
+            </View>
           </TouchableOpacity>
 
-          <TouchableOpacity style={styles.playButton} onPress={togglePlayPause}>
-            <Text style={{ fontSize: 24 }}>{isPlaying ? "⏸" : "▶"}</Text>
+          <TouchableOpacity style={[styles.playButton, { backgroundColor: colors.rideBlue }]} onPress={togglePlayPause}>
+            {isPlaying ? (
+              <View style={styles.pauseIcon}>
+                <View style={styles.pauseBar} />
+                <View style={styles.pauseBar} />
+              </View>
+            ) : (
+              <View style={[styles.playTriangle, { marginLeft: 3 }]} />
+            )}
           </TouchableOpacity>
 
           <TouchableOpacity style={styles.controlButton}>
-            <Text style={{ color: theme.text, fontSize: 24 }}>⏭</Text>
+            <View style={styles.skipIcon}>
+              <View style={[styles.skipBar, { backgroundColor: theme.text, marginLeft: 2 }]} />
+              <View style={[styles.skipTriangle, { borderRightColor: theme.text }]} />
+            </View>
           </TouchableOpacity>
         </View>
       </View>
@@ -667,7 +672,7 @@ const styles = StyleSheet.create({
     elevation: 3,
   },
   bottomPanel: {
-    paddingBottom: 30,
+    paddingBottom: 34,
     borderTopLeftRadius: 20,
     borderTopRightRadius: 20,
     shadowColor: "#000",
@@ -722,7 +727,6 @@ const styles = StyleSheet.create({
     width: 56,
     height: 56,
     borderRadius: 28,
-    backgroundColor: "#fff",
     justifyContent: "center",
     alignItems: "center",
     shadowColor: "#000",
@@ -730,5 +734,56 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.15,
     shadowRadius: 4,
     elevation: 4,
+  },
+  playTriangle: {
+    width: 0,
+    height: 0,
+    borderTopWidth: 10,
+    borderBottomWidth: 10,
+    borderLeftWidth: 16,
+    borderTopColor: "transparent",
+    borderBottomColor: "transparent",
+    borderLeftColor: "#fff",
+  },
+  pauseIcon: {
+    flexDirection: "row",
+    gap: 4,
+  },
+  pauseBar: {
+    width: 4,
+    height: 18,
+    backgroundColor: "#fff",
+    borderRadius: 2,
+  },
+  skipIcon: {
+    flexDirection: "row",
+    alignItems: "center",
+  },
+  skipTriangle: {
+    width: 0,
+    height: 0,
+    borderTopWidth: 8,
+    borderBottomWidth: 8,
+    borderRightWidth: 12,
+    borderTopColor: "transparent",
+    borderBottomColor: "transparent",
+  },
+  skipBar: {
+    width: 3,
+    height: 16,
+    borderRadius: 1.5,
+  },
+  poiMarker: {
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    justifyContent: "center",
+    alignItems: "center",
+    borderWidth: 2,
+  },
+  poiMarkerText: {
+    color: "#fff",
+    fontSize: 9,
+    fontWeight: "800",
   },
 });

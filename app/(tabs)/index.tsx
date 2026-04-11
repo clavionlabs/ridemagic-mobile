@@ -16,39 +16,31 @@ import {
 } from "react-native";
 import * as Location from "expo-location";
 import MapView, { Marker, Polyline, PROVIDER_GOOGLE } from "react-native-maps";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useRouter } from "expo-router";
 import { Audio } from "expo-av";
 import { ENV } from "../../src/config/env";
 import { colors, spacing, fontSize, borderRadius } from "../../src/theme";
+import { lightMapStyle, darkMapStyle } from "../../src/theme/mapStyles";
 import { markerImages } from "../../src/lib/markerAssets";
 import { useAuth } from "../../src/hooks/useAuth";
 import { supabase } from "../../src/lib/supabase";
 import * as api from "../../src/services/api";
 
-const lightMapStyle = [
-  { featureType: "poi", elementType: "labels", stylers: [{ visibility: "off" }] },
-  { featureType: "poi.business", stylers: [{ visibility: "off" }] },
-  { featureType: "transit", elementType: "labels", stylers: [{ visibility: "off" }] },
-];
-
-const darkMapStyle = [
-  { elementType: "geometry", stylers: [{ color: "#1d2c4d" }] },
-  { elementType: "labels.text.fill", stylers: [{ color: "#8ec3b9" }] },
-  { elementType: "labels.text.stroke", stylers: [{ color: "#1a3646" }] },
-  { featureType: "poi", elementType: "labels", stylers: [{ visibility: "off" }] },
-  { featureType: "poi.business", stylers: [{ visibility: "off" }] },
-  { featureType: "transit", elementType: "labels", stylers: [{ visibility: "off" }] },
-  { featureType: "road", elementType: "geometry", stylers: [{ color: "#304a7d" }] },
-  { featureType: "water", elementType: "geometry", stylers: [{ color: "#0e1626" }] },
-];
-
-// Interpolate gradient color for polyline segments
+// 3-stop brand gradient: #7C5CFC → #0078FF → #00E89D
 function getGradientColor(factor: number): string {
-  const GRAD_START = [124, 92, 252]; // #7C5CFC
-  const GRAD_END = [0, 232, 157];    // #00E89D
-  const r = Math.round(GRAD_START[0] + (GRAD_END[0] - GRAD_START[0]) * factor);
-  const g = Math.round(GRAD_START[1] + (GRAD_END[1] - GRAD_START[1]) * factor);
-  const b = Math.round(GRAD_START[2] + (GRAD_END[2] - GRAD_START[2]) * factor);
+  const stops = [
+    [124, 92, 252],  // #7C5CFC
+    [0, 120, 255],   // #0078FF
+    [0, 232, 157],   // #00E89D
+  ];
+  const segment = factor < 0.5 ? 0 : 1;
+  const localFactor = factor < 0.5 ? factor * 2 : (factor - 0.5) * 2;
+  const from = stops[segment];
+  const to = stops[segment + 1];
+  const r = Math.round(from[0] + (to[0] - from[0]) * localFactor);
+  const g = Math.round(from[1] + (to[1] - from[1]) * localFactor);
+  const b = Math.round(from[2] + (to[2] - from[2]) * localFactor);
   return `rgb(${r}, ${g}, ${b})`;
 }
 
@@ -76,6 +68,7 @@ export default function HomeScreen() {
   const router = useRouter();
   const { user, loading: authLoading } = useAuth();
   const mapRef = useRef<MapView>(null);
+  const insets = useSafeAreaInsets();
 
   const [origin, setOrigin] = useState("");
   const [destination, setDestination] = useState("");
@@ -520,14 +513,20 @@ export default function HomeScreen() {
           />
         )}
 
-        {/* POI markers */}
+        {/* POI markers — numbered circles with brand colors */}
         {pois.map((poi: any, i: number) => (
           <Marker
             key={`poi-${i}`}
             coordinate={{ latitude: poi.location.lat, longitude: poi.location.lng }}
             title={poi.name}
-            image={markerImages.poiBlue}
-          />
+          >
+            <View style={[styles.poiMarker, {
+              backgroundColor: isDark ? colors.mysticPurple : colors.rideBlue,
+              borderColor: isDark ? colors.nearBlack : "#fff",
+            }]}>
+              <Text style={styles.poiMarkerText}>{i + 1}</Text>
+            </View>
+          </Marker>
         ))}
 
         {/* User location marker in driving mode */}
@@ -564,7 +563,7 @@ export default function HomeScreen() {
           backgroundColor: theme.surface,
           paddingBottom: keyboardUp
             ? Animated.add(keyboardOffsetAnim, spacing.sm) as any
-            : spacing.xl,
+            : insets.bottom + 24,
           transform: [{
             translateY: panelAnim.interpolate({
               inputRange: [0, 1],
@@ -880,5 +879,18 @@ const styles = StyleSheet.create({
     color: "#fff",
     fontSize: fontSize.sm,
     fontWeight: "600",
+  },
+  poiMarker: {
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    justifyContent: "center",
+    alignItems: "center",
+    borderWidth: 2,
+  },
+  poiMarkerText: {
+    color: "#fff",
+    fontSize: 9,
+    fontWeight: "800",
   },
 });
