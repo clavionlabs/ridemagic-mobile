@@ -1,5 +1,6 @@
 import { Tabs } from "expo-router";
 import { useColorScheme } from "react-native";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { colors } from "../../src/theme";
 
 function TabIcon({ name, focused }: { name: string; focused: boolean }) {
@@ -16,6 +17,7 @@ function TabIcon({ name, focused }: { name: string; focused: boolean }) {
 export default function TabLayout() {
   const colorScheme = useColorScheme();
   const isDark = colorScheme === "dark";
+  const insets = useSafeAreaInsets();
 
   return (
     <Tabs
@@ -26,9 +28,9 @@ export default function TabLayout() {
         tabBarStyle: {
           backgroundColor: isDark ? colors.dark.surface : colors.light.surface,
           borderTopColor: isDark ? colors.dark.border : colors.light.border,
-          paddingBottom: 8,
+          paddingBottom: insets.bottom > 0 ? insets.bottom : 8,
           paddingTop: 8,
-          height: 64,
+          height: 64 + (insets.bottom > 0 ? insets.bottom : 0),
         },
         tabBarLabelStyle: {
           fontSize: 11,

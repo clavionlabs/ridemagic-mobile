@@ -1,7 +1,6 @@
 import { Stack } from "expo-router";
 import { StatusBar } from "expo-status-bar";
 import { useColorScheme } from "react-native";
-import { NavigationProvider } from "@googlemaps/react-native-navigation-sdk";
 import { colors } from "../src/theme";
 
 export default function RootLayout() {
@@ -10,13 +9,7 @@ export default function RootLayout() {
   const theme = isDark ? colors.dark : colors.light;
 
   return (
-    <NavigationProvider
-      termsAndConditionsDialogOptions={{
-        title: "RideMagic Navigation",
-        companyName: "RideMagic",
-        showOnlyDisclaimer: true,
-      }}
-    >
+    <>
       <StatusBar style={isDark ? "light" : "dark"} />
       <Stack
         screenOptions={{
@@ -35,6 +28,6 @@ export default function RootLayout() {
           }}
         />
       </Stack>
-    </NavigationProvider>
+    </>
   );
 }

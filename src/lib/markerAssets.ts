@@ -1,12 +1,9 @@
-// Marker paths relative to Android assets/ folder
-// These are copied there by the navigation-sdk config plugin
-export function getMarkerPaths() {
-  return {
-    poiBlue: "markers/poi-blue.png",
-    poiGreen: "markers/poi-green.png",
-    poiPurple: "markers/poi-purple.png",
-    origin: "markers/origin.png",
-    destination: "markers/destination.png",
-    userArrow: "markers/user-arrow.png",
-  };
-}
+// Marker image assets for react-native-maps
+export const markerImages = {
+  poiBlue: require("../../assets/markers/poi-blue.png"),
+  poiGreen: require("../../assets/markers/poi-green.png"),
+  poiPurple: require("../../assets/markers/poi-purple.png"),
+  origin: require("../../assets/markers/origin.png"),
+  destination: require("../../assets/markers/destination.png"),
+  userArrow: require("../../assets/markers/user-arrow.png"),
+};
