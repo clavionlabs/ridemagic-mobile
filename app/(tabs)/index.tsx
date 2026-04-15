@@ -504,7 +504,7 @@ export default function HomeScreen() {
         // DEV ONLY — simulate driving along the calculated route so you can
         // test the driving experience while stationary. Set SIMULATE_DRIVING
         // to false (or remove) for real-device production use.
-        const SIMULATE_DRIVING = true;
+        const SIMULATE_DRIVING = false;
         if (SIMULATE_DRIVING && !cancelled) {
           try {
             navigationController.simulator.simulateLocationsAlongExistingRoute({
