@@ -1,10 +1,10 @@
-import { View, Text, StyleSheet, useColorScheme } from "react-native";
+import { Text, StyleSheet } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
-import { colors, fontSize } from "../../src/theme";
+import { fontSize } from "../../src/theme";
+import { useTheme } from "../../src/hooks/useTheme";
 
 export default function ToursScreen() {
-  const isDark = useColorScheme() === "dark";
-  const theme = isDark ? colors.dark : colors.light;
+  const { theme } = useTheme();
 
   return (
     <SafeAreaView style={[styles.container, { backgroundColor: theme.background }]}>

@@ -5,34 +5,50 @@ import {
   TextInput,
   TouchableOpacity,
   StyleSheet,
-  useColorScheme,
   Alert,
   ActivityIndicator,
   Animated,
   PanResponder,
   Keyboard,
   FlatList,
-  Platform,
 } from "react-native";
 import * as Location from "expo-location";
-import MapView, { Marker, Polyline, PROVIDER_GOOGLE } from "react-native-maps";
+import {
+  NavigationView,
+  useNavigation,
+  CameraPerspective,
+  TravelMode,
+  AudioGuidance,
+  NavigationNightMode,
+  NavigationUIEnabledPreference,
+  MapColorScheme,
+} from "@googlemaps/react-native-navigation-sdk";
+import type {
+  MapViewController,
+  NavigationViewController,
+} from "@googlemaps/react-native-navigation-sdk";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useRouter } from "expo-router";
 import { Audio } from "expo-av";
 import { ENV } from "../../src/config/env";
 import { colors, spacing, fontSize, borderRadius } from "../../src/theme";
-import { lightMapStyle, darkMapStyle } from "../../src/theme/mapStyles";
-import { markerImages } from "../../src/lib/markerAssets";
+import { getMarkerPaths } from "../../src/lib/markerAssets";
 import { useAuth } from "../../src/hooks/useAuth";
+import { useTheme } from "../../src/hooks/useTheme";
 import { supabase } from "../../src/lib/supabase";
 import * as api from "../../src/services/api";
+
+// Note: the SDK's `mapStyle` prop is broken (expects a remote URL that returns
+// JSON, not inline JSON) — we use the native `mapColorScheme` prop instead,
+// which is the proper Google Maps API for switching light/dark. Trade-off:
+// we lose the POI label hiding that a custom style gave us.
 
 // 3-stop brand gradient: #7C5CFC → #0078FF → #00E89D
 function getGradientColor(factor: number): string {
   const stops = [
-    [124, 92, 252],  // #7C5CFC
-    [0, 120, 255],   // #0078FF
-    [0, 232, 157],   // #00E89D
+    [124, 92, 252],
+    [0, 120, 255],
+    [0, 232, 157],
   ];
   const segment = factor < 0.5 ? 0 : 1;
   const localFactor = factor < 0.5 ? factor * 2 : (factor - 0.5) * 2;
@@ -44,30 +60,12 @@ function getGradientColor(factor: number): string {
   return `rgb(${r}, ${g}, ${b})`;
 }
 
-// Split path into gradient segments
-function getGradientSegments(path: { lat: number; lng: number }[], numSegments = 20) {
-  if (path.length < 2) return [];
-  const segSize = Math.max(1, Math.floor(path.length / numSegments));
-  const segments: { coordinates: { latitude: number; longitude: number }[]; color: string }[] = [];
-
-  for (let i = 0; i < path.length - 1; i += segSize) {
-    const end = Math.min(i + segSize + 1, path.length);
-    const factor = i / (path.length - 1);
-    segments.push({
-      coordinates: path.slice(i, end).map((p) => ({ latitude: p.lat, longitude: p.lng })),
-      color: getGradientColor(factor),
-    });
-  }
-  return segments;
-}
-
 export default function HomeScreen() {
-  const colorScheme = useColorScheme();
-  const isDark = colorScheme === "dark";
-  const theme = isDark ? colors.dark : colors.light;
+  const { isDark, theme } = useTheme();
   const router = useRouter();
   const { user, loading: authLoading } = useAuth();
-  const mapRef = useRef<MapView>(null);
+  const mapControllerRef = useRef<MapViewController | null>(null);
+  const navViewControllerRef = useRef<NavigationViewController | null>(null);
   const insets = useSafeAreaInsets();
 
   const [origin, setOrigin] = useState("Current Location");
@@ -84,23 +82,26 @@ export default function HomeScreen() {
   const [loadingTour, setLoadingTour] = useState(false);
   const [tourReady, setTourReady] = useState(false);
   const [routeId, setRouteId] = useState<string | null>(null);
+  const [mapReady, setMapReady] = useState(false);
+  const [navViewReady, setNavViewReady] = useState(false);
   const [isDriving, setIsDriving] = useState(false);
   const [userLoc, setUserLoc] = useState<{ lat: number; lng: number } | null>(null);
-
-  // Get user's current location
-  useEffect(() => {
-    (async () => {
-      const { status } = await Location.requestForegroundPermissionsAsync();
-      if (status !== "granted") return;
-      const loc = await Location.getCurrentPositionAsync({});
-      setUserLoc({ lat: loc.coords.latitude, lng: loc.coords.longitude });
-    })();
-  }, []);
 
   const soundRef = useRef<Audio.Sound | null>(null);
   const bgMusicRef = useRef<Audio.Sound | null>(null);
   const triggeredPoisRef = useRef<Set<string>>(new Set());
   const [tourPois, setTourPois] = useState<any[]>([]);
+  // Ref mirror of tourPois so the geofence listener can read fresh data
+  // without having to re-register when tourPois updates.
+  const tourPoisRef = useRef<any[]>([]);
+  useEffect(() => { tourPoisRef.current = tourPois; }, [tourPois]);
+
+  // POI audio queue — POIs that triggered while another narration is playing
+  // wait here until the current one finishes (plus a small gap), rather than
+  // interrupting each other. Matches the tour page's queue pattern.
+  const poiQueueRef = useRef<any[]>([]);
+  const isPlayingPoiRef = useRef(false);
+  const POI_GAP_MS = 2500; // silent gap between consecutive POI narrations
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const originInputRef = useRef<TextInput>(null);
   const destInputRef = useRef<TextInput>(null);
@@ -187,7 +188,10 @@ export default function HomeScreen() {
       destInputRef.current?.blur();
     }
     setActiveField(null);
-    if (routeData) { setRouteData(null); setPois([]); setTourReady(false); setRouteId(null); }
+    if (routeData) {
+      setRouteData(null); setPois([]); setTourReady(false); setRouteId(null);
+      try { mapControllerRef.current?.clearMapView(); } catch {}
+    }
   }, [routeData]);
 
   // Redirect to auth if not logged in
@@ -199,97 +203,358 @@ export default function HomeScreen() {
     }
   }, [user, authLoading]);
 
-  // Fit map to route when routeData changes
+  const onMapViewControllerCreated = useCallback((controller: MapViewController) => {
+    mapControllerRef.current = controller;
+    setMapReady(true);
+  }, []);
+
+  // Get user's current location and move camera to it once the map is ready
   useEffect(() => {
-    if (!routeData?.decodedPath || routeData.decodedPath.length < 2) return;
-
-    const coordinates = routeData.decodedPath.map((p: any) => ({
-      latitude: p.lat,
-      longitude: p.lng,
-    }));
-
-    setTimeout(() => {
-      mapRef.current?.fitToCoordinates(coordinates, {
-        edgePadding: { top: 80, right: 40, bottom: 300, left: 40 },
-        animated: true,
-      });
-    }, 500);
-  }, [routeData]);
-
-  // Location tracking for driving mode
-  const locationSubRef = useRef<Location.LocationSubscription | null>(null);
-  const [drivingLocation, setDrivingLocation] = useState<{ lat: number; lng: number; heading: number | null } | null>(null);
-
-  useEffect(() => {
-    if (!isDriving) {
-      locationSubRef.current?.remove();
-      locationSubRef.current = null;
-      setDrivingLocation(null);
-      return;
-    }
-
+    if (!mapReady) return;
     (async () => {
       const { status } = await Location.requestForegroundPermissionsAsync();
       if (status !== "granted") return;
-
-      locationSubRef.current = await Location.watchPositionAsync(
-        { accuracy: Location.Accuracy.BestForNavigation, distanceInterval: 5, timeInterval: 1000 },
-        (loc) => {
-          const coords = { lat: loc.coords.latitude, lng: loc.coords.longitude, heading: loc.coords.heading };
-          setDrivingLocation(coords);
-
-          // Follow user
-          mapRef.current?.animateCamera({
-            center: { latitude: coords.lat, longitude: coords.lng },
-            pitch: 45,
-            heading: coords.heading || 0,
-            zoom: 17,
-          }, { duration: 800 });
-        }
-      );
-    })();
-
-    return () => { locationSubRef.current?.remove(); };
-  }, [isDriving]);
-
-  // POI geofencing during driving
-  useEffect(() => {
-    if (!isDriving || !drivingLocation || tourPois.length === 0) return;
-
-    const TRIGGER_RADIUS_M = 150;
-    const haversine = (lat1: number, lng1: number, lat2: number, lng2: number) => {
-      const R = 6371000;
-      const dLat = ((lat2 - lat1) * Math.PI) / 180;
-      const dLng = ((lng2 - lng1) * Math.PI) / 180;
-      const a = Math.sin(dLat / 2) ** 2 +
-        Math.cos((lat1 * Math.PI) / 180) * Math.cos((lat2 * Math.PI) / 180) * Math.sin(dLng / 2) ** 2;
-      return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-    };
-
-    for (const poi of tourPois) {
-      if (triggeredPoisRef.current.has(poi.id)) continue;
-      const dist = haversine(drivingLocation.lat, drivingLocation.lng, poi.lat, poi.lng);
-      if (dist <= TRIGGER_RADIUS_M && poi.audio_url) {
-        triggeredPoisRef.current.add(poi.id);
-
-        (async () => {
-          if (bgMusicRef.current) await bgMusicRef.current.setVolumeAsync(0.05);
-          if (soundRef.current) await soundRef.current.unloadAsync();
-          const { sound } = await Audio.Sound.createAsync(
-            { uri: poi.audio_url },
-            { shouldPlay: true }
-          );
-          soundRef.current = sound;
-          sound.setOnPlaybackStatusUpdate((status: any) => {
-            if (status.isLoaded && status.didJustFinish) {
-              bgMusicRef.current?.setVolumeAsync(0.15);
-            }
+      const loc = await Location.getCurrentPositionAsync({});
+      const coords = { lat: loc.coords.latitude, lng: loc.coords.longitude };
+      setUserLoc(coords);
+      // Small delay to ensure native MapView is fully attached before moveCamera
+      setTimeout(() => {
+        try {
+          mapControllerRef.current?.moveCamera({
+            target: coords,
+            zoom: 14,
+            tilt: 0,
+            bearing: 0,
           });
-        })();
-        break;
+        } catch (e) {
+          console.warn("Initial moveCamera failed:", e);
+        }
+      }, 1000);
+    })();
+  }, [mapReady]);
+
+  // Reusable draw function — paints the polyline, markers, and fits the camera to the route.
+  // Called by the useEffect below (on route change), handleStartTour (driving entry),
+  // and handleExitDriving (on exit).
+  //
+  // Options:
+  //   hideOrigin — skip the green origin marker (used in driving mode so the user's
+  //     real position marker isn't hidden under a static start circle)
+  //   hidePolyline — skip the gradient preview polyline (Nav SDK draws its own
+  //     route line during guidance, no need to duplicate)
+  //   fitCamera — whether to move the camera to fit the route bounds (skipped
+  //     during driving mode since the Nav SDK manages camera follow)
+  const drawRouteOnMap = useCallback(async (opts?: {
+    hideOrigin?: boolean;
+    hidePolyline?: boolean;
+    fitCamera?: boolean;
+  }) => {
+    const controller = mapControllerRef.current;
+    if (!controller || !routeData?.decodedPath) return;
+
+    const hideOrigin = opts?.hideOrigin ?? false;
+    const hidePolyline = opts?.hidePolyline ?? false;
+    const fitCamera = opts?.fitCamera ?? true;
+
+    const coordinates = routeData.decodedPath.map((p: any) => ({
+      lat: p.lat,
+      lng: p.lng,
+    }));
+
+    // Clear anything previously drawn so repeat draws don't stack
+    try { controller.clearMapView(); } catch {}
+
+    // Draw gradient polyline in segments (Google Nav SDK = one color per polyline)
+    if (!hidePolyline) {
+      try {
+        const totalSegs = coordinates.length - 1;
+        const batchSize = Math.max(1, Math.floor(totalSegs / 40));
+        for (let i = 0; i < totalSegs; i += batchSize) {
+          const end = Math.min(i + batchSize + 1, coordinates.length);
+          const factor = i / totalSegs;
+          const color = getGradientColor(factor);
+          await controller.addPolyline({
+            points: coordinates.slice(i, end),
+            color,
+            width: 5,
+          });
+        }
+      } catch (e) {
+        console.warn("Polyline failed:", e);
       }
     }
-  }, [isDriving, drivingLocation, tourPois]);
+
+    // Draw markers
+    try {
+      const markers = getMarkerPaths();
+      if (!hideOrigin) {
+        await controller.addMarker({
+          position: { lat: routeData.originLat, lng: routeData.originLng },
+          title: "Start",
+          imgPath: markers.origin,
+        });
+      }
+      await controller.addMarker({
+        position: { lat: routeData.destinationLat, lng: routeData.destinationLng },
+        title: "Destination",
+        imgPath: markers.destination,
+      });
+      for (const poi of pois) {
+        await controller.addMarker({
+          position: { lat: poi.location.lat, lng: poi.location.lng },
+          title: poi.name,
+          imgPath: markers.poiBlue,
+        });
+      }
+    } catch (e) {
+      console.warn("Markers failed:", e);
+    }
+
+    // Skip camera fit if caller doesn't want it (e.g. driving mode — Nav SDK controls camera)
+    if (!fitCamera) return;
+
+    // Fit camera to route bounds + bearing so destination is up
+    if (coordinates.length > 1) {
+      const lats = coordinates.map((c: any) => c.lat);
+      const lngs = coordinates.map((c: any) => c.lng);
+
+      const oLat = (routeData.originLat * Math.PI) / 180;
+      const dLat = (routeData.destinationLat * Math.PI) / 180;
+      const dLng = ((routeData.destinationLng - routeData.originLng) * Math.PI) / 180;
+      const y = Math.sin(dLng) * Math.cos(dLat);
+      const x = Math.cos(oLat) * Math.sin(dLat) - Math.sin(oLat) * Math.cos(dLat) * Math.cos(dLng);
+      const bearing = ((Math.atan2(y, x) * 180) / Math.PI + 360) % 360;
+
+      const latSpan = Math.max(...lats) - Math.min(...lats);
+      const lngSpan = Math.max(...lngs) - Math.min(...lngs);
+      const maxSpan = Math.max(latSpan, lngSpan);
+      const zoom = maxSpan < 0.005 ? 17
+        : maxSpan < 0.01 ? 16
+        : maxSpan < 0.02 ? 15
+        : maxSpan < 0.04 ? 14
+        : maxSpan < 0.08 ? 13
+        : maxSpan < 0.16 ? 12
+        : maxSpan < 0.3 ? 11
+        : maxSpan < 0.6 ? 10
+        : 9;
+
+      try {
+        controller.moveCamera({
+          target: {
+            lat: (Math.min(...lats) + Math.max(...lats)) / 2,
+            lng: (Math.min(...lngs) + Math.max(...lngs)) / 2,
+          },
+          zoom,
+          bearing,
+          tilt: 0,
+        });
+      } catch (e) {
+        console.warn("Camera fit failed:", e);
+      }
+    }
+  }, [routeData, pois]);
+
+  // Draw the route on the map whenever routeData or pois change
+  useEffect(() => {
+    if (!mapReady || !routeData?.decodedPath) return;
+    const timer = setTimeout(() => {
+      drawRouteOnMap().catch((e) => console.warn("Draw route failed:", e));
+    }, 1000);
+    return () => clearTimeout(timer);
+  }, [routeData, pois, mapReady, drawRouteOnMap]);
+
+  // Google Navigation SDK — start native turn-by-turn driving
+  const { navigationController, setOnLocationChanged } = useNavigation();
+
+  useEffect(() => {
+    if (!isDriving || !routeData || !navViewReady) return;
+
+    let cancelled = false;
+
+    const startNavigation = async () => {
+      try {
+        const termsAccepted = await navigationController.areTermsAccepted();
+        if (!termsAccepted) {
+          await navigationController.showTermsAndConditionsDialog();
+        }
+        if (cancelled) return;
+
+        // init() is idempotent — calling it on an already-initialized navigator is a no-op
+        const status = await navigationController.init();
+        console.log("Nav init status:", status);
+        if (cancelled) return;
+
+        // Short settle delay so the native navigator is ready for setDestination
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        if (cancelled) return;
+
+        const routeStatus = await navigationController.setDestination(
+          { position: { lat: routeData.destinationLat, lng: routeData.destinationLng } },
+          { routingOptions: { travelMode: TravelMode.DRIVING } }
+        );
+        console.log("Route status:", routeStatus);
+        if (cancelled) return;
+
+        await navigationController.startGuidance();
+        navigationController.setAudioGuidanceType(AudioGuidance.SILENT);
+
+        // Start GPS streaming — required for setOnLocationChanged to fire.
+        // Without this the listener is registered but receives no events.
+        try {
+          navigationController.startUpdatingLocation();
+          console.log("Nav location updates started");
+        } catch (e) {
+          console.warn("startUpdatingLocation failed:", e);
+        }
+
+        // Register geofencing listener right here (not in a separate effect)
+        // so it's set up ONCE per drive and doesn't churn on tourPois updates.
+        // The listener reads tourPois from a ref so it always sees current data.
+        const TRIGGER_RADIUS_M = 200;
+        const haversine = (lat1: number, lng1: number, lat2: number, lng2: number) => {
+          const R = 6371000;
+          const dLat = ((lat2 - lat1) * Math.PI) / 180;
+          const dLng = ((lng2 - lng1) * Math.PI) / 180;
+          const a = Math.sin(dLat / 2) ** 2 +
+            Math.cos((lat1 * Math.PI) / 180) * Math.cos((lat2 * Math.PI) / 180) * Math.sin(dLng / 2) ** 2;
+          return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+        };
+
+        // Plays a POI narration, waits for it to finish + a silent gap,
+        // then pulls the next queued POI and plays it. This prevents narrations
+        // from interrupting each other when POIs are close together.
+        const playPoiAudio = async (poi: any) => {
+          isPlayingPoiRef.current = true;
+          try {
+            if (bgMusicRef.current) await bgMusicRef.current.setVolumeAsync(0.08);
+            if (soundRef.current) {
+              try { await soundRef.current.unloadAsync(); } catch {}
+            }
+            const { sound } = await Audio.Sound.createAsync(
+              { uri: poi.audio_url },
+              { shouldPlay: true }
+            );
+            soundRef.current = sound;
+            sound.setOnPlaybackStatusUpdate((status: any) => {
+              if (status.isLoaded && status.didJustFinish) {
+                // After the narration ends, restore music, wait a beat, then
+                // play the next queued POI if one is waiting.
+                bgMusicRef.current?.setVolumeAsync(0.4);
+                setTimeout(() => {
+                  const next = poiQueueRef.current.shift();
+                  if (next) {
+                    console.log(`[Geofence] ▶ Playing queued "${next.name}"`);
+                    playPoiAudio(next);
+                  } else {
+                    isPlayingPoiRef.current = false;
+                  }
+                }, POI_GAP_MS);
+              }
+            });
+          } catch (e: any) {
+            console.warn(`[Geofence] POI audio failed for "${poi.name}":`, e?.message || e);
+            // Don't strand the queue on a failure — try the next one
+            isPlayingPoiRef.current = false;
+            const next = poiQueueRef.current.shift();
+            if (next) playPoiAudio(next);
+          }
+        };
+
+        let logCounter = 0;
+        setOnLocationChanged((location: any) => {
+          const pois = tourPoisRef.current;
+          if (pois.length === 0) return;
+
+          logCounter++;
+          const shouldLog = logCounter % 10 === 0;
+
+          let closestDist = Infinity;
+          let closestPoi: any = null;
+          for (const poi of pois) {
+            if (triggeredPoisRef.current.has(poi.id)) continue;
+            if (!poi.audio_url) continue;
+            const dist = haversine(location.lat, location.lng, poi.lat, poi.lng);
+            if (dist < closestDist) {
+              closestDist = dist;
+              closestPoi = poi;
+            }
+            if (dist <= TRIGGER_RADIUS_M) {
+              triggeredPoisRef.current.add(poi.id);
+              if (isPlayingPoiRef.current) {
+                // Something is playing — queue this POI to play after
+                poiQueueRef.current.push(poi);
+                console.log(
+                  `[Geofence] ⏳ QUEUED "${poi.name}" (${poiQueueRef.current.length} in queue)`
+                );
+              } else {
+                console.log(`[Geofence] ✅ TRIGGER "${poi.name}" at ${dist.toFixed(0)}m`);
+                playPoiAudio(poi);
+              }
+              return;
+            }
+          }
+          if (shouldLog) {
+            console.log(
+              `[Geofence] loc=(${location.lat.toFixed(5)},${location.lng.toFixed(5)}) ` +
+              `closest="${closestPoi?.name ?? "none"}" dist=${closestDist === Infinity ? "∞" : closestDist.toFixed(0) + "m"}`
+            );
+          }
+        });
+
+        // DEV ONLY — simulate driving along the calculated route so you can
+        // test the driving experience while stationary. Set SIMULATE_DRIVING
+        // to false (or remove) for real-device production use.
+        const SIMULATE_DRIVING = true;
+        if (SIMULATE_DRIVING && !cancelled) {
+          try {
+            navigationController.simulator.simulateLocationsAlongExistingRoute({
+              speedMultiplier: 5,
+            });
+            console.log("Route simulation started at 5x speed");
+          } catch (e) {
+            console.warn("Route simulation failed:", e);
+          }
+        }
+
+        // Apply the tilted follow perspective immediately so the puck becomes
+        // a chevron right away. Re-apply it after a short delay so it takes
+        // effect after guidance is fully running and the first location update
+        // has landed — otherwise the SDK falls back to a blue dot.
+        if (navViewControllerRef.current) {
+          navViewControllerRef.current.setFollowingPerspective(CameraPerspective.TILTED);
+        }
+        setTimeout(() => {
+          if (!cancelled && navViewControllerRef.current) {
+            try {
+              navViewControllerRef.current.setFollowingPerspective(CameraPerspective.TILTED);
+            } catch {}
+          }
+        }, 800);
+        setTimeout(() => {
+          if (!cancelled && navViewControllerRef.current) {
+            try {
+              navViewControllerRef.current.setFollowingPerspective(CameraPerspective.TILTED);
+            } catch {}
+          }
+        }, 2500);
+      } catch (e) {
+        console.warn("Navigation start failed:", e);
+      }
+    };
+
+    startNavigation();
+
+    return () => {
+      cancelled = true;
+      // Unregister the location listener first so we don't receive events
+      // during teardown
+      try { setOnLocationChanged(null); } catch {}
+      try { navigationController.simulator.stopLocationSimulation(); } catch {}
+      try { navigationController.stopUpdatingLocation(); } catch {}
+      navigationController.stopGuidance().catch(() => {});
+      navigationController.clearDestinations().catch(() => {});
+    };
+  }, [isDriving, routeData, navViewReady, setOnLocationChanged]);
 
   const handleGetDirections = async () => {
     if (!destination.trim()) {
@@ -386,60 +651,112 @@ export default function HomeScreen() {
   const handleStartTour = async () => {
     if (!routeId) return;
 
+    // Re-draw overlays for driving mode: hide the green origin marker (user is
+    // there, don't cover their real location puck) and hide our static gradient
+    // polyline (Nav SDK draws its own live route line). Keep POI + destination
+    // markers so the user can see upcoming stops during the drive.
+    drawRouteOnMap({ hideOrigin: true, hidePolyline: true, fitCamera: false })
+      .catch((e) => console.warn("Drive-mode draw failed:", e));
+
+    // Switch to driving mode IMMEDIATELY — audio + data load in the background below
     togglePanel(false);
     setIsDriving(true);
 
-    await Audio.setAudioModeAsync({
+    // Configure audio mode (quick, non-blocking)
+    Audio.setAudioModeAsync({
       allowsRecordingIOS: false,
       staysActiveInBackground: true,
       playsInSilentModeIOS: true,
-    });
+    }).catch(() => {});
 
-    try {
-      const { data: routeRow } = await supabase
-        .from("routes")
-        .select("welcome_audio_url, music_track_id")
-        .eq("id", routeId)
-        .single();
+    triggeredPoisRef.current = new Set();
+    poiQueueRef.current = [];
+    isPlayingPoiRef.current = false;
 
-      const { data: poiRows } = await supabase
-        .from("route_pois")
-        .select("id, name, lat, lng, audio_url, audio_duration_sec, is_neighborhood_intro")
-        .eq("route_id", routeId)
-        .order("sequence_order", { ascending: true });
+    // Fetch route row + POI data in parallel — don't block UI transition
+    (async () => {
+      try {
+        const [routeResult, poiResult] = await Promise.all([
+          supabase
+            .from("routes")
+            .select("welcome_audio_url, music_track_id")
+            .eq("id", routeId)
+            .single(),
+          supabase
+            .from("route_pois")
+            .select("id, name, lat, lng, audio_url, audio_duration_sec, is_neighborhood_intro")
+            .eq("route_id", routeId)
+            .order("sequence_order", { ascending: true }),
+        ]);
 
-      if (poiRows) setTourPois(poiRows);
-      triggeredPoisRef.current = new Set();
+        const routeRow = routeResult.data;
+        const poiRows = poiResult.data;
 
-      if (routeRow?.welcome_audio_url) {
-        if (soundRef.current) await soundRef.current.unloadAsync();
-        const { sound } = await Audio.Sound.createAsync(
-          { uri: routeRow.welcome_audio_url },
-          { shouldPlay: true }
-        );
-        soundRef.current = sound;
+        if (poiRows) setTourPois(poiRows);
+
+        // Welcome audio + background music — fire both in parallel so whichever is ready first plays
+        if (routeRow?.welcome_audio_url) {
+          (async () => {
+            try {
+              if (soundRef.current) await soundRef.current.unloadAsync();
+              const { sound } = await Audio.Sound.createAsync(
+                { uri: routeRow.welcome_audio_url },
+                { shouldPlay: true }
+              );
+              soundRef.current = sound;
+              sound.setOnPlaybackStatusUpdate((status: any) => {
+                if (status.isLoaded && status.didJustFinish) {
+                  bgMusicRef.current?.setVolumeAsync(0.4);
+                }
+              });
+              bgMusicRef.current?.setVolumeAsync(0.08);
+            } catch (e: any) {
+              console.warn("Welcome audio failed:", e?.message || e);
+            }
+          })();
+        }
+
+        if (routeRow?.music_track_id) {
+          (async () => {
+            try {
+              const { data: musicData, error: musicErr } = await supabase
+                .from("music_tracks")
+                .select("audio_url")
+                .eq("id", routeRow.music_track_id)
+                .single();
+              if (musicErr) {
+                console.warn("Music track lookup failed:", musicErr.message);
+              } else if (musicData?.audio_url) {
+                const { sound: music } = await Audio.Sound.createAsync(
+                  { uri: musicData.audio_url },
+                  { shouldPlay: true, isLooping: true, volume: 0.4 }
+                );
+                bgMusicRef.current = music;
+                console.log("Background music started");
+              }
+            } catch (e: any) {
+              console.warn("Background music failed:", e?.message || e);
+            }
+          })();
+        } else {
+          console.log("No music_track_id on this route");
+        }
+      } catch (e) {
+        console.warn("Start tour data fetch failed:", e);
       }
-
-      if (routeRow?.music_track_id) {
-        try {
-          const { data: trackData } = await supabase.storage
-            .from("music")
-            .createSignedUrl(routeRow.music_track_id, 3600);
-          if (trackData?.signedUrl) {
-            const { sound: music } = await Audio.Sound.createAsync(
-              { uri: trackData.signedUrl },
-              { shouldPlay: true, isLooping: true, volume: 0.15 }
-            );
-            bgMusicRef.current = music;
-          }
-        } catch {}
-      }
-    } catch (e) {
-      console.warn("Start tour failed:", e);
-    }
+    })();
   };
 
-  const handleExitDriving = async () => {
+  const handleExitDriving = useCallback(async () => {
+    // Do NOT reset navViewReady here — the NavigationView is always mounted, so
+    // onNavigationViewControllerCreated only fires once. Resetting navViewReady
+    // would block the next Start Tour from entering driving mode.
+    setIsDriving(false);
+
+    // Clear POI audio queue + reset playing flag so a fresh Start Tour starts clean
+    poiQueueRef.current = [];
+    isPlayingPoiRef.current = false;
+
     if (soundRef.current) {
       await soundRef.current.stopAsync();
       await soundRef.current.unloadAsync();
@@ -451,29 +768,25 @@ export default function HomeScreen() {
       bgMusicRef.current = null;
     }
     setTourPois([]);
-    setIsDriving(false);
 
-    if (routeData?.decodedPath?.length > 1) {
-      const coordinates = routeData.decodedPath.map((p: any) => ({
-        latitude: p.lat,
-        longitude: p.lng,
-      }));
-      mapRef.current?.fitToCoordinates(coordinates, {
-        edgePadding: { top: 80, right: 40, bottom: 300, left: 40 },
-        animated: true,
-      });
-    } else if (userLoc) {
-      mapRef.current?.animateToRegion({
-        latitude: userLoc.lat,
-        longitude: userLoc.lng,
-        latitudeDelta: 0.01,
-        longitudeDelta: 0.01,
-      });
-    }
-  };
-
-  // Gradient polyline segments
-  const gradientSegments = routeData?.decodedPath ? getGradientSegments(routeData.decodedPath) : [];
+    // Restore the map to the exact "Get Directions" view: polyline, markers, bearing, zoom
+    setTimeout(() => {
+      if (routeData?.decodedPath?.length > 1) {
+        drawRouteOnMap().catch((e) => console.warn("Exit-drive draw failed:", e));
+      } else if (userLoc && mapControllerRef.current) {
+        try {
+          mapControllerRef.current.moveCamera({
+            target: userLoc,
+            zoom: 14,
+            tilt: 0,
+            bearing: 0,
+          });
+        } catch (e) {
+          console.warn("Exit-drive moveCamera failed:", e);
+        }
+      }
+    }, 500);
+  }, [routeData, userLoc, drawRouteOnMap]);
 
   if (authLoading) {
     return (
@@ -485,86 +798,32 @@ export default function HomeScreen() {
 
   return (
     <View style={[styles.container, { backgroundColor: theme.background }]}>
-      {/* Map */}
-      <MapView
-        ref={mapRef}
+      {/* Map — single NavigationView, always mounted; becomes drive UI when isDriving */}
+      <NavigationView
         style={styles.map}
-        provider={PROVIDER_GOOGLE}
-        customMapStyle={isDark ? darkMapStyle : lightMapStyle}
-        showsUserLocation={!isDriving}
-        showsMyLocationButton={false}
-        initialRegion={{
-          latitude: userLoc?.lat || 37.7749,
-          longitude: userLoc?.lng || -122.4194,
-          latitudeDelta: 0.05,
-          longitudeDelta: 0.05,
+        onMapViewControllerCreated={onMapViewControllerCreated}
+        onNavigationViewControllerCreated={(controller) => {
+          navViewControllerRef.current = controller;
+          setNavViewReady(true);
         }}
-      >
-        {/* Route polyline with gradient */}
-        {gradientSegments.map((seg, i) => (
-          <Polyline
-            key={`route-seg-${i}`}
-            coordinates={seg.coordinates}
-            strokeColor={seg.color}
-            strokeWidth={5}
-          />
-        ))}
+        mapColorScheme={isDark ? MapColorScheme.DARK : MapColorScheme.LIGHT}
+        headerEnabled={false}
+        footerEnabled={false}
+        speedometerEnabled={false}
+        recenterButtonEnabled={isDriving}
+        navigationNightMode={isDark ? NavigationNightMode.FORCE_NIGHT : NavigationNightMode.FORCE_DAY}
+        navigationUIEnabledPreference={isDriving ? NavigationUIEnabledPreference.AUTOMATIC : NavigationUIEnabledPreference.DISABLED}
+      />
 
-        {/* Origin marker */}
-        {routeData && (
-          <Marker
-            coordinate={{ latitude: routeData.originLat, longitude: routeData.originLng }}
-            title="Start"
-            image={markerImages.origin}
-          />
-        )}
-
-        {/* Destination marker */}
-        {routeData && (
-          <Marker
-            coordinate={{ latitude: routeData.destinationLat, longitude: routeData.destinationLng }}
-            title="Destination"
-            image={markerImages.destination}
-          />
-        )}
-
-        {/* POI markers — numbered circles with brand colors */}
-        {pois.map((poi: any, i: number) => (
-          <Marker
-            key={`poi-${i}`}
-            coordinate={{ latitude: poi.location.lat, longitude: poi.location.lng }}
-            title={poi.name}
-          >
-            <View style={[styles.poiMarker, {
-              backgroundColor: isDark ? colors.mysticPurple : colors.rideBlue,
-              borderColor: isDark ? colors.nearBlack : "#fff",
-            }]}>
-              <Text style={styles.poiMarkerText}>{i + 1}</Text>
-            </View>
-          </Marker>
-        ))}
-
-        {/* User location marker in driving mode */}
-        {isDriving && drivingLocation && (
-          <Marker
-            coordinate={{ latitude: drivingLocation.lat, longitude: drivingLocation.lng }}
-            anchor={{ x: 0.5, y: 0.5 }}
-            flat
-            rotation={drivingLocation.heading || 0}
-            image={markerImages.userArrow}
-          />
-        )}
-      </MapView>
-
-      {/* Exit driving mode button */}
+      {/* Exit driving button */}
       {isDriving && (
-        <TouchableOpacity style={styles.exitDrivingButton} onPress={handleExitDriving}>
+        <TouchableOpacity style={[styles.exitDrivingButton, { top: insets.top + 12 }]} onPress={handleExitDriving}>
           <Text style={styles.exitDrivingText}>✕  Exit Driving</Text>
         </TouchableOpacity>
       )}
 
       {/* Expand button when collapsed */}
-      {!panelOpen && (
+      {!panelOpen && !isDriving && (
         <View style={[styles.expandButton, { backgroundColor: theme.surface }]}>
           <TouchableOpacity onPress={() => togglePanel(true)} style={styles.expandTouchable}>
             <Text style={{ color: theme.text, fontSize: 18 }}>▲</Text>
@@ -572,27 +831,28 @@ export default function HomeScreen() {
         </View>
       )}
 
-      {/* Bottom Panel */}
-      <Animated.View
-        style={[styles.panel, {
-          backgroundColor: theme.surface,
-          paddingBottom: keyboardUp
-            ? Animated.add(keyboardOffsetAnim, spacing.sm) as any
-            : insets.bottom + 24,
-          transform: [{
-            translateY: panelAnim.interpolate({
-              inputRange: [0, 1],
-              outputRange: [0, 400],
-            }),
-          }],
-        }]}
-        {...panResponder.panHandlers}
-      >
-        <TouchableOpacity onPress={() => togglePanel(!panelOpen)} activeOpacity={0.7}>
-          <View style={styles.dragHandle} />
-        </TouchableOpacity>
+      {/* Bottom panel — hidden during driving */}
+      {!isDriving && (
+        <Animated.View
+          style={[styles.panel, {
+            backgroundColor: theme.surface,
+            paddingBottom: keyboardUp
+              ? Animated.add(keyboardOffsetAnim, spacing.sm) as any
+              : insets.bottom + 24,
+            transform: [{
+              translateY: panelAnim.interpolate({
+                inputRange: [0, 1],
+                outputRange: [0, 400],
+              }),
+            }],
+          }]}
+          {...panResponder.panHandlers}
+        >
+          <TouchableOpacity onPress={() => togglePanel(!panelOpen)} activeOpacity={0.7}>
+            <View style={styles.dragHandle} />
+          </TouchableOpacity>
 
-          {/* Origin row — collapsed by default, shows "Current Location" */}
+          {/* Origin row — collapsed by default; expands to show starting point after tap */}
           {showOriginField || routeData ? (
             <>
               <TouchableOpacity
@@ -616,6 +876,7 @@ export default function HomeScreen() {
                       if (origin !== "Current Location") setOrigin("");
                       if (routeData) {
                         setRouteData(null); setPois([]); setTourReady(false); setRouteId(null);
+                        try { mapControllerRef.current?.clearMapView(); } catch {}
                       }
                       fetchSuggestions(text, "origin");
                     }}
@@ -644,6 +905,7 @@ export default function HomeScreen() {
                     if (destination) setDestination("");
                     if (routeData) {
                       setRouteData(null); setPois([]); setTourReady(false); setRouteId(null);
+                      try { mapControllerRef.current?.clearMapView(); } catch {}
                     }
                     fetchSuggestions(text, "dest");
                   }}
@@ -674,7 +936,6 @@ export default function HomeScreen() {
             (activeField === "dest" && destSuggestions.length > 0)
           ) && (
             <View style={[styles.suggestionsList, { backgroundColor: theme.surface, borderColor: theme.border }]}>
-              {/* "Use Current Location" option for origin field */}
               {activeField === "origin" && (
                 <TouchableOpacity
                   style={[styles.suggestionItem, styles.yourLocationItem]}
@@ -769,7 +1030,8 @@ export default function HomeScreen() {
               </TouchableOpacity>
             )
           )}
-      </Animated.View>
+        </Animated.View>
+      )}
     </View>
   );
 }
@@ -922,7 +1184,6 @@ const styles = StyleSheet.create({
   },
   exitDrivingButton: {
     position: "absolute",
-    top: 50,
     left: 16,
     backgroundColor: "rgba(0,0,0,0.7)",
     borderRadius: 24,
@@ -930,23 +1191,11 @@ const styles = StyleSheet.create({
     paddingVertical: 10,
     flexDirection: "row",
     alignItems: "center",
+    zIndex: 100,
   },
   exitDrivingText: {
     color: "#fff",
     fontSize: fontSize.sm,
     fontWeight: "600",
-  },
-  poiMarker: {
-    width: 28,
-    height: 28,
-    borderRadius: 14,
-    justifyContent: "center",
-    alignItems: "center",
-    borderWidth: 2,
-  },
-  poiMarkerText: {
-    color: "#fff",
-    fontSize: 9,
-    fontWeight: "800",
   },
 });

@@ -3,25 +3,42 @@ import {
   View,
   Text,
   StyleSheet,
-  useColorScheme,
   TouchableOpacity,
   ScrollView,
   ActivityIndicator,
-  Dimensions,
 } from "react-native";
-import MapView, { Marker, Polyline, PROVIDER_GOOGLE } from "react-native-maps";
+import { MapView, MapColorScheme } from "@googlemaps/react-native-navigation-sdk";
+import type { MapViewController } from "@googlemaps/react-native-navigation-sdk";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { Audio } from "expo-av";
 import * as Location from "expo-location";
 import { activateKeepAwakeAsync, deactivateKeepAwake } from "expo-keep-awake";
 import { colors, fontSize, spacing, borderRadius } from "../../src/theme";
-import { lightMapStyle, darkMapStyle } from "../../src/theme/mapStyles";
-import { markerImages } from "../../src/lib/markerAssets";
+import { getMarkerPaths } from "../../src/lib/markerAssets";
 import { useAuth } from "../../src/hooks/useAuth";
+import { useTheme } from "../../src/hooks/useTheme";
 import { supabase } from "../../src/lib/supabase";
 
-const { width: SCREEN_WIDTH } = Dimensions.get("window");
+// mapStyle prop on this SDK is broken (expects a remote URL, not inline JSON)
+// — we use the native mapColorScheme prop instead for dark/light switching.
+
+// 3-stop brand gradient: #7C5CFC → #0078FF → #00E89D
+function getGradientColor(factor: number): string {
+  const stops = [
+    [124, 92, 252],
+    [0, 120, 255],
+    [0, 232, 157],
+  ];
+  const segment = factor < 0.5 ? 0 : 1;
+  const localFactor = factor < 0.5 ? factor * 2 : (factor - 0.5) * 2;
+  const from = stops[segment];
+  const to = stops[segment + 1];
+  const r = Math.round(from[0] + (to[0] - from[0]) * localFactor);
+  const g = Math.round(from[1] + (to[1] - from[1]) * localFactor);
+  const b = Math.round(from[2] + (to[2] - from[2]) * localFactor);
+  return `rgb(${r}, ${g}, ${b})`;
+}
 
 interface RouteData {
   id: string;
@@ -97,11 +114,11 @@ const TRIGGER_RADIUS_M = 150;
 
 export default function TourScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
-  const isDark = useColorScheme() === "dark";
-  const theme = isDark ? colors.dark : colors.light;
+  const { isDark, theme } = useTheme();
   const router = useRouter();
   const { user } = useAuth();
-  const mapRef = useRef<MapView>(null);
+  const mapControllerRef = useRef<MapViewController | null>(null);
+  const [mapReady, setMapReady] = useState(false);
   const insets = useSafeAreaInsets();
 
   // Data
@@ -125,8 +142,12 @@ export default function TourScreen() {
   // Audio
   const soundRef = useRef<Audio.Sound | null>(null);
   const bgMusicRef = useRef<Audio.Sound | null>(null);
-  const progressIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const poiQueueRef = useRef<number[]>([]);
+
+  const onMapViewControllerCreated = useCallback((controller: MapViewController) => {
+    mapControllerRef.current = controller;
+    setMapReady(true);
+  }, []);
 
   // Fetch route + POIs
   useEffect(() => {
@@ -180,22 +201,72 @@ export default function TourScreen() {
     return () => clearInterval(interval);
   }, [pois, id]);
 
-  // Fit map to route when data loads
+  // Draw gradient polyline + markers when data is ready
   useEffect(() => {
-    if (decodedPath.length < 2) return;
+    const controller = mapControllerRef.current;
+    if (!controller || !mapReady || decodedPath.length < 2 || !route) return;
 
-    const coordinates = decodedPath.map((p) => ({
-      latitude: p.lat,
-      longitude: p.lng,
-    }));
+    const timer = setTimeout(async () => {
+      // Gradient polyline
+      try {
+        const totalSegs = decodedPath.length - 1;
+        const batchSize = Math.max(1, Math.floor(totalSegs / 40));
+        for (let i = 0; i < totalSegs; i += batchSize) {
+          const end = Math.min(i + batchSize + 1, decodedPath.length);
+          const factor = i / totalSegs;
+          const color = getGradientColor(factor);
+          await controller.addPolyline({
+            points: decodedPath.slice(i, end),
+            color,
+            width: 5,
+          });
+        }
+      } catch (e) {
+        console.warn("Tour polyline failed:", e);
+      }
 
-    setTimeout(() => {
-      mapRef.current?.fitToCoordinates(coordinates, {
-        edgePadding: { top: 80, right: 40, bottom: 280, left: 40 },
-        animated: true,
+      // Markers
+      try {
+        const markers = getMarkerPaths();
+        await controller.addMarker({
+          position: { lat: route.origin_lat, lng: route.origin_lng },
+          title: "Start",
+          imgPath: markers.origin,
+        });
+        await controller.addMarker({
+          position: { lat: route.destination_lat, lng: route.destination_lng },
+          title: "Destination",
+          imgPath: markers.destination,
+        });
+        const visible = pois.filter((p) => !p.is_neighborhood_intro);
+        for (let i = 0; i < visible.length; i++) {
+          const poi = visible[i];
+          await controller.addMarker({
+            position: { lat: poi.lat, lng: poi.lng },
+            title: `${i + 1}. ${poi.name}`,
+            imgPath: markers.poiBlue,
+          });
+        }
+      } catch (e) {
+        console.warn("Tour markers failed:", e);
+      }
+
+      // Fit to bounds
+      const lats = decodedPath.map((p) => p.lat);
+      const lngs = decodedPath.map((p) => p.lng);
+      controller.moveCamera({
+        target: {
+          lat: (Math.min(...lats) + Math.max(...lats)) / 2,
+          lng: (Math.min(...lngs) + Math.max(...lngs)) / 2,
+        },
+        zoom: 12,
+        tilt: 0,
+        bearing: 0,
       });
-    }, 500);
-  }, [decodedPath]);
+    }, 1000);
+
+    return () => clearTimeout(timer);
+  }, [decodedPath, pois, route, mapReady]);
 
   // Location tracking
   useEffect(() => {
@@ -247,16 +318,16 @@ export default function TourScreen() {
 
   // Auto-follow in driving mode
   useEffect(() => {
-    if (!drivingMode || !userLocation) return;
+    if (!drivingMode || !userLocation || !mapReady) return;
     if (tourState === "idle" || tourState === "completed") return;
 
-    mapRef.current?.animateCamera({
-      center: { latitude: userLocation.lat, longitude: userLocation.lng },
-      pitch: 45,
-      heading: userLocation.heading || 0,
+    mapControllerRef.current?.moveCamera({
+      target: { lat: userLocation.lat, lng: userLocation.lng },
+      tilt: 45,
+      bearing: userLocation.heading || 0,
       zoom: 17,
-    }, { duration: 800 });
-  }, [userLocation, drivingMode, tourState]);
+    });
+  }, [userLocation, drivingMode, tourState, mapReady]);
 
   // Keep screen awake during tour
   useEffect(() => {
@@ -309,18 +380,6 @@ export default function TourScreen() {
       console.error("Audio playback error:", err);
       onFinish?.();
     }
-  }, []);
-
-  // Stop audio
-  const stopAudio = useCallback(async () => {
-    if (soundRef.current) {
-      await soundRef.current.stopAsync();
-      await soundRef.current.unloadAsync();
-      soundRef.current = null;
-    }
-    setIsPlaying(false);
-    setCurrentTime(0);
-    setDuration(0);
   }, []);
 
   // Play welcome
@@ -390,14 +449,17 @@ export default function TourScreen() {
   // Exit driving mode
   const exitDrivingMode = useCallback(() => {
     setDrivingMode(false);
-    if (decodedPath.length > 0) {
-      const coordinates = decodedPath.map((p) => ({
-        latitude: p.lat,
-        longitude: p.lng,
-      }));
-      mapRef.current?.fitToCoordinates(coordinates, {
-        edgePadding: { top: 80, right: 40, bottom: 280, left: 40 },
-        animated: true,
+    if (decodedPath.length > 0 && mapControllerRef.current) {
+      const lats = decodedPath.map((p) => p.lat);
+      const lngs = decodedPath.map((p) => p.lng);
+      mapControllerRef.current.moveCamera({
+        target: {
+          lat: (Math.min(...lats) + Math.max(...lats)) / 2,
+          lng: (Math.min(...lngs) + Math.max(...lngs)) / 2,
+        },
+        zoom: 12,
+        tilt: 0,
+        bearing: 0,
       });
     }
   }, [decodedPath]);
@@ -408,12 +470,6 @@ export default function TourScreen() {
     : currentSegmentIndex >= pois.length
       ? "Tour Complete"
       : pois[currentSegmentIndex]?.name || "";
-
-  // Polyline coordinates for react-native-maps
-  const routeCoordinates = decodedPath.map((p) => ({ latitude: p.lat, longitude: p.lng }));
-
-  // Visible (non-intro) POIs for markers
-  const visiblePois = pois.filter((p) => !p.is_neighborhood_intro);
 
   if (loading) {
     return (
@@ -452,73 +508,14 @@ export default function TourScreen() {
 
       {/* Map */}
       <MapView
-        ref={mapRef}
         style={styles.map}
-        provider={PROVIDER_GOOGLE}
-        customMapStyle={isDark ? darkMapStyle : lightMapStyle}
-        showsUserLocation={!drivingMode}
-        showsMyLocationButton={false}
-        initialRegion={{
-          latitude: route?.origin_lat || 37.7749,
-          longitude: route?.origin_lng || -122.4194,
-          latitudeDelta: 0.05,
-          longitudeDelta: 0.05,
+        onMapViewControllerCreated={onMapViewControllerCreated}
+        mapColorScheme={isDark ? MapColorScheme.DARK : MapColorScheme.LIGHT}
+        initialCameraPosition={{
+          target: { lat: route?.origin_lat || 37.7749, lng: route?.origin_lng || -122.4194 },
+          zoom: 12,
         }}
-      >
-        {/* Route polyline */}
-        {routeCoordinates.length > 1 && (
-          <Polyline
-            coordinates={routeCoordinates}
-            strokeColor={colors.rideBlue}
-            strokeWidth={5}
-          />
-        )}
-
-        {/* Origin marker */}
-        {route && (
-          <Marker
-            coordinate={{ latitude: route.origin_lat, longitude: route.origin_lng }}
-            title="Start"
-            image={markerImages.origin}
-          />
-        )}
-
-        {/* Destination marker */}
-        {route && (
-          <Marker
-            coordinate={{ latitude: route.destination_lat, longitude: route.destination_lng }}
-            title="Destination"
-            image={markerImages.destination}
-          />
-        )}
-
-        {/* POI markers — numbered circles with brand colors */}
-        {visiblePois.map((poi, i) => (
-          <Marker
-            key={`poi-${poi.id}`}
-            coordinate={{ latitude: poi.lat, longitude: poi.lng }}
-            title={`${i + 1}. ${poi.name}`}
-          >
-            <View style={[styles.poiMarker, {
-              backgroundColor: isDark ? colors.mysticPurple : colors.rideBlue,
-              borderColor: isDark ? colors.nearBlack : "#fff",
-            }]}>
-              <Text style={styles.poiMarkerText}>{i + 1}</Text>
-            </View>
-          </Marker>
-        ))}
-
-        {/* User location in driving mode */}
-        {drivingMode && userLocation && (
-          <Marker
-            coordinate={{ latitude: userLocation.lat, longitude: userLocation.lng }}
-            anchor={{ x: 0.5, y: 0.5 }}
-            flat
-            rotation={userLocation.heading || 0}
-            image={markerImages.userArrow}
-          />
-        )}
-      </MapView>
+      />
 
       {/* Map overlay buttons */}
       {drivingMode && (
@@ -781,18 +778,5 @@ const styles = StyleSheet.create({
     width: 3,
     height: 16,
     borderRadius: 1.5,
-  },
-  poiMarker: {
-    width: 28,
-    height: 28,
-    borderRadius: 14,
-    justifyContent: "center",
-    alignItems: "center",
-    borderWidth: 2,
-  },
-  poiMarkerText: {
-    color: "#fff",
-    fontSize: 9,
-    fontWeight: "800",
   },
 });

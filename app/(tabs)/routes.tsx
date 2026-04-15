@@ -3,7 +3,6 @@ import {
   View,
   Text,
   StyleSheet,
-  useColorScheme,
   FlatList,
   TouchableOpacity,
   ActivityIndicator,
@@ -12,6 +11,7 @@ import { useRouter } from "expo-router";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { colors, fontSize, spacing, borderRadius } from "../../src/theme";
 import { useAuth } from "../../src/hooks/useAuth";
+import { useTheme } from "../../src/hooks/useTheme";
 import { supabase } from "../../src/lib/supabase";
 
 interface Route {
@@ -52,8 +52,7 @@ const gradientColors = [
 ];
 
 export default function RoutesScreen() {
-  const isDark = useColorScheme() === "dark";
-  const theme = isDark ? colors.dark : colors.light;
+  const { isDark, theme } = useTheme();
   const router = useRouter();
   const { user } = useAuth();
   const [routes, setRoutes] = useState<Route[]>([]);

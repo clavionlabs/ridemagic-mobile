@@ -91,7 +91,8 @@
             "deploymentTarget": "16.0"
           }
         }
-      ]
+      ],
+      "./plugins/navigation-sdk-plugin.js"
     ],
     "extra": {
       "router": {},

@@ -5,7 +5,6 @@ import {
   TextInput,
   TouchableOpacity,
   StyleSheet,
-  useColorScheme,
   Alert,
   ActivityIndicator,
   KeyboardAvoidingView,
@@ -15,10 +14,10 @@ import { useRouter, Link } from "expo-router";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { colors, fontSize, spacing, borderRadius } from "../../src/theme";
 import { useAuth } from "../../src/hooks/useAuth";
+import { useTheme } from "../../src/hooks/useTheme";
 
 export default function SignupScreen() {
-  const isDark = useColorScheme() === "dark";
-  const theme = isDark ? colors.dark : colors.light;
+  const { theme } = useTheme();
   const router = useRouter();
   const { signUp } = useAuth();
 

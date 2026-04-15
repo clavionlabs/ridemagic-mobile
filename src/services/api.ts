@@ -142,6 +142,13 @@ export async function getUserStats() {
   return res.json();
 }
 
+export async function getUserTopics() {
+  const headers = await getAuthHeaders();
+  const res = await fetch(`${API}/api/user/topics`, { headers });
+  if (!res.ok) throw new Error("Failed to get user topics");
+  return res.json();
+}
+
 export async function getUserRoutes() {
   const headers = await getAuthHeaders();
   const res = await fetch(`${API}/api/user/routes`, { headers });

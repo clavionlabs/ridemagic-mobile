@@ -1,7 +1,7 @@
 import { Tabs } from "expo-router";
-import { useColorScheme } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { colors } from "../../src/theme";
+import { useTheme } from "../../src/hooks/useTheme";
 
 function TabIcon({ name, focused }: { name: string; focused: boolean }) {
   // Simple text-based icons — replace with proper icons later
@@ -15,8 +15,7 @@ function TabIcon({ name, focused }: { name: string; focused: boolean }) {
 }
 
 export default function TabLayout() {
-  const colorScheme = useColorScheme();
-  const isDark = colorScheme === "dark";
+  const { isDark } = useTheme();
   const insets = useSafeAreaInsets();
 
   return (

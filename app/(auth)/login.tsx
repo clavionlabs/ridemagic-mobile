@@ -5,20 +5,20 @@ import {
   TextInput,
   TouchableOpacity,
   StyleSheet,
-  useColorScheme,
   Alert,
   ActivityIndicator,
   KeyboardAvoidingView,
   Platform,
+  Image,
 } from "react-native";
 import { useRouter, Link } from "expo-router";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { colors, fontSize, spacing, borderRadius } from "../../src/theme";
 import { useAuth } from "../../src/hooks/useAuth";
+import { useTheme } from "../../src/hooks/useTheme";
 
 export default function LoginScreen() {
-  const isDark = useColorScheme() === "dark";
-  const theme = isDark ? colors.dark : colors.light;
+  const { theme } = useTheme();
   const router = useRouter();
   const { signIn } = useAuth();
 
@@ -50,9 +50,11 @@ export default function LoginScreen() {
         style={styles.content}
       >
         <View style={styles.header}>
-          <Text style={[styles.brand, { color: colors.rideBlue }]}>
-            Ride<Text style={{ color: colors.magicGreen }}>Magic</Text>
-          </Text>
+          <Image
+            source={require("../../assets/splash-icon.png")}
+            style={styles.logo}
+            resizeMode="contain"
+          />
           <Text style={[styles.tagline, { color: theme.textSecondary }]}>
             Your AI Audio Tour Guide
           </Text>
@@ -111,7 +113,7 @@ const styles = StyleSheet.create({
   container: { flex: 1 },
   content: { flex: 1, justifyContent: "center", paddingHorizontal: spacing.lg },
   header: { alignItems: "center", marginBottom: spacing.xxl },
-  brand: { fontSize: 36, fontWeight: "800" },
+  logo: { width: 160, height: 160, marginBottom: spacing.sm },
   tagline: { fontSize: fontSize.md, marginTop: spacing.xs },
   form: { gap: spacing.md },
   input: {
@@ -122,7 +124,7 @@ const styles = StyleSheet.create({
     fontSize: fontSize.md,
   },
   button: {
-    backgroundColor: colors.rideBlue,
+    backgroundColor: colors.mysticPurple,
     borderRadius: borderRadius.md,
     paddingVertical: 16,
     alignItems: "center",
