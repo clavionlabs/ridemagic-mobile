@@ -2,6 +2,7 @@ import { Stack } from "expo-router";
 import { StatusBar } from "expo-status-bar";
 import { NavigationProvider } from "@googlemaps/react-native-navigation-sdk";
 import { ThemeProvider, useTheme } from "../src/hooks/useTheme";
+import { ActiveTourProvider } from "../src/hooks/useActiveTour";
 
 function ThemedRoot() {
   const { isDark, theme } = useTheme();
@@ -38,7 +39,9 @@ function ThemedRoot() {
 export default function RootLayout() {
   return (
     <ThemeProvider>
-      <ThemedRoot />
+      <ActiveTourProvider>
+        <ThemedRoot />
+      </ActiveTourProvider>
     </ThemeProvider>
   );
 }

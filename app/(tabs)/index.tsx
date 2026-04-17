@@ -11,6 +11,7 @@ import {
   PanResponder,
   Keyboard,
   FlatList,
+  Image,
 } from "react-native";
 import * as Location from "expo-location";
 import {
@@ -21,20 +22,21 @@ import {
   AudioGuidance,
   NavigationNightMode,
   NavigationUIEnabledPreference,
-  MapColorScheme,
 } from "@googlemaps/react-native-navigation-sdk";
 import type {
   MapViewController,
   NavigationViewController,
 } from "@googlemaps/react-native-navigation-sdk";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
-import { useRouter } from "expo-router";
+import { useRouter, useLocalSearchParams } from "expo-router";
 import { Audio } from "expo-av";
+import { LinearGradient } from "expo-linear-gradient";
 import { ENV } from "../../src/config/env";
 import { colors, spacing, fontSize, borderRadius } from "../../src/theme";
 import { getMarkerPaths } from "../../src/lib/markerAssets";
 import { useAuth } from "../../src/hooks/useAuth";
 import { useTheme } from "../../src/hooks/useTheme";
+import { useActiveTour } from "../../src/hooks/useActiveTour";
 import { supabase } from "../../src/lib/supabase";
 import * as api from "../../src/services/api";
 
@@ -63,7 +65,9 @@ function getGradientColor(factor: number): string {
 export default function HomeScreen() {
   const { isDark, theme } = useTheme();
   const router = useRouter();
+  const params = useLocalSearchParams<{ liveTourId?: string }>();
   const { user, loading: authLoading } = useAuth();
+  const { startTour: setActiveTour, stopTour: clearActiveTour } = useActiveTour();
   const mapControllerRef = useRef<MapViewController | null>(null);
   const navViewControllerRef = useRef<NavigationViewController | null>(null);
   const insets = useSafeAreaInsets();
@@ -85,12 +89,64 @@ export default function HomeScreen() {
   const [mapReady, setMapReady] = useState(false);
   const [navViewReady, setNavViewReady] = useState(false);
   const [isDriving, setIsDriving] = useState(false);
+  const [tourPaused, setTourPaused] = useState(false);
   const [userLoc, setUserLoc] = useState<{ lat: number; lng: number } | null>(null);
 
   const soundRef = useRef<Audio.Sound | null>(null);
   const bgMusicRef = useRef<Audio.Sound | null>(null);
   const triggeredPoisRef = useRef<Set<string>>(new Set());
   const [tourPois, setTourPois] = useState<any[]>([]);
+  const [tourLoadingLabel, setTourLoadingLabel] = useState("Generating Tour...");
+
+  // Current POI being narrated during driving — drives the POI detail panel
+  const [currentDrivingPoi, setCurrentDrivingPoi] = useState<any>(null);
+  const [poiPanelExpanded, setPoiPanelExpanded] = useState(true);
+  const [poiPhotoUrl, setPoiPhotoUrl] = useState<string | null>(null);
+  const poiPhotoCache = useRef<Record<string, string>>({});
+  // Ref callback so the geofencing closure (inside nav effect) can update React state
+  const setCurrentDrivingPoiRef = useRef(setCurrentDrivingPoi);
+  useEffect(() => { setCurrentDrivingPoiRef.current = setCurrentDrivingPoi; }, [setCurrentDrivingPoi]);
+
+  // Fetch Google Places photo when the active driving POI changes
+  useEffect(() => {
+    if (!currentDrivingPoi?.place_id) {
+      setPoiPhotoUrl(null);
+      return;
+    }
+    const placeId = currentDrivingPoi.place_id;
+
+    // Use cached URL if available
+    if (poiPhotoCache.current[placeId]) {
+      setPoiPhotoUrl(poiPhotoCache.current[placeId]);
+      return;
+    }
+
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch(
+          `https://maps.googleapis.com/maps/api/place/details/json?place_id=${placeId}&fields=photos&key=${ENV.GOOGLE_MAPS_API_KEY}`
+        );
+        const data = await res.json();
+        const photoRef = data?.result?.photos?.[0]?.photo_reference;
+        if (cancelled) return;
+        if (photoRef) {
+          const url = `https://maps.googleapis.com/maps/api/place/photo?maxwidth=600&photo_reference=${photoRef}&key=${ENV.GOOGLE_MAPS_API_KEY}`;
+          poiPhotoCache.current[placeId] = url;
+          setPoiPhotoUrl(url);
+        } else {
+          // No photo available — fall back to static map
+          const fallback = `https://maps.googleapis.com/maps/api/staticmap?center=${currentDrivingPoi.lat},${currentDrivingPoi.lng}&zoom=17&size=600x200&maptype=roadmap&markers=color:0x0078FF|${currentDrivingPoi.lat},${currentDrivingPoi.lng}&key=${ENV.GOOGLE_MAPS_API_KEY}`;
+          poiPhotoCache.current[placeId] = fallback;
+          setPoiPhotoUrl(fallback);
+        }
+      } catch {
+        if (!cancelled) setPoiPhotoUrl(null);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [currentDrivingPoi]);
+
   // Ref mirror of tourPois so the geofence listener can read fresh data
   // without having to re-register when tourPois updates.
   const tourPoisRef = useRef<any[]>([]);
@@ -202,6 +258,54 @@ export default function HomeScreen() {
       router.replace("/(auth)/login");
     }
   }, [user, authLoading]);
+
+  // Handle liveTourId param from My Routes → "Live Tour" button.
+  // Loads route data from Supabase and pre-fills state so Start Tour is ready.
+  const liveTourHandledRef = useRef<string | null>(null);
+  useEffect(() => {
+    const liveTourId = params.liveTourId;
+    if (!liveTourId || !user || liveTourHandledRef.current === liveTourId) return;
+    liveTourHandledRef.current = liveTourId;
+
+    (async () => {
+      try {
+        const { data: route } = await supabase
+          .from("routes")
+          .select("id, origin_address, destination_address, origin_lat, origin_lng, destination_lat, destination_lng, polyline, total_distance_m, total_duration_sec")
+          .eq("id", liveTourId)
+          .single();
+        if (!route) return;
+
+        const { data: poiData } = await supabase
+          .from("route_pois")
+          .select("id, name, lat, lng, types, place_id, audio_url")
+          .eq("route_id", liveTourId)
+          .order("sequence_order", { ascending: true });
+
+        // Build routeData in the same shape as getDirections()
+        setOrigin(route.origin_address);
+        setDestination(route.destination_address);
+        setRouteData({
+          polyline: route.polyline,
+          distanceM: route.total_distance_m,
+          durationSec: route.total_duration_sec,
+          originLat: route.origin_lat,
+          originLng: route.origin_lng,
+          destinationLat: route.destination_lat,
+          destinationLng: route.destination_lng,
+          decodedPath: route.polyline ? api.decodePolyline(route.polyline) : [],
+        });
+        setPois(poiData?.map((p: any) => ({
+          ...p,
+          location: { lat: p.lat, lng: p.lng },
+        })) || []);
+        setRouteId(liveTourId);
+        setShowOriginField(true);
+      } catch (e) {
+        console.warn("Failed to load live tour:", e);
+      }
+    })();
+  }, [params.liveTourId, user]);
 
   const onMapViewControllerCreated = useCallback((controller: MapViewController) => {
     mapControllerRef.current = controller;
@@ -370,7 +474,125 @@ export default function HomeScreen() {
     if (!isDriving || !routeData || !navViewReady) return;
 
     let cancelled = false;
+    const TRIGGER_RADIUS_M = 300;
 
+    // ── Audio playback engine ──
+    let audioGen = 0;
+
+    const playPoiAudio = async (poi: any) => {
+      const gen = ++audioGen;
+      isPlayingPoiRef.current = true;
+      setCurrentDrivingPoiRef.current(poi);
+      try {
+        try { await bgMusicRef.current?.setVolumeAsync(0.08); } catch {}
+
+        if (soundRef.current) {
+          try {
+            await soundRef.current.stopAsync();
+            await soundRef.current.unloadAsync();
+          } catch {}
+          soundRef.current = null;
+        }
+
+        if (gen !== audioGen) return;
+
+        const { sound } = await Audio.Sound.createAsync(
+          { uri: poi.audio_url },
+          { shouldPlay: true }
+        );
+
+        if (gen !== audioGen) {
+          sound.unloadAsync().catch(() => {});
+          return;
+        }
+
+        soundRef.current = sound;
+        sound.setOnPlaybackStatusUpdate((status: any) => {
+          if (gen !== audioGen) return;
+          if (status.isLoaded && status.didJustFinish) {
+            try { bgMusicRef.current?.setVolumeAsync(0.4); } catch {}
+            setTimeout(() => {
+              if (gen !== audioGen) return;
+              const next = poiQueueRef.current.shift();
+              if (next) {
+                console.log(`[Nav] ▶ Playing queued "${next.name}"`);
+                playPoiAudio(next);
+              } else {
+                isPlayingPoiRef.current = false;
+                setCurrentDrivingPoiRef.current(null);
+              }
+            }, POI_GAP_MS);
+          }
+        });
+      } catch (e: any) {
+        if (gen !== audioGen) return;
+        console.warn(`[Nav] POI audio failed for "${poi.name}":`, e?.message || e);
+        isPlayingPoiRef.current = false;
+        const next = poiQueueRef.current.shift();
+        if (next) playPoiAudio(next);
+      }
+    };
+
+    // ── Proximity geofencing ──
+    const haversine = (lat1: number, lng1: number, lat2: number, lng2: number) => {
+      const R = 6371000;
+      const dLat = ((lat2 - lat1) * Math.PI) / 180;
+      const dLng = ((lng2 - lng1) * Math.PI) / 180;
+      const a = Math.sin(dLat / 2) ** 2 +
+        Math.cos((lat1 * Math.PI) / 180) * Math.cos((lat2 * Math.PI) / 180) * Math.sin(dLng / 2) ** 2;
+      return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    };
+
+    let logCounter = 0;
+    let lastLocKey = "";
+
+    const handleLocationUpdate = (location: any) => {
+      const locKey = `${location?.lat?.toFixed(5)},${location?.lng?.toFixed(5)}`;
+      if (locKey === lastLocKey) return;
+      lastLocKey = locKey;
+
+      logCounter++;
+      if (logCounter <= 3) {
+        console.log(`[Nav] Location #${logCounter}: (${location?.lat},${location?.lng}) pois=${tourPoisRef.current.length}`);
+      }
+      const pois = tourPoisRef.current;
+      if (pois.length === 0) return;
+
+      const shouldLog = logCounter % 10 === 0;
+      let closestDist = Infinity;
+      let closestPoi: any = null;
+      for (const poi of pois) {
+        if (triggeredPoisRef.current.has(poi.id)) continue;
+        if (!poi.audio_url) continue;
+        const dist = haversine(location.lat, location.lng, poi.lat, poi.lng);
+        if (dist < closestDist) {
+          closestDist = dist;
+          closestPoi = poi;
+        }
+        if (dist <= TRIGGER_RADIUS_M) {
+          triggeredPoisRef.current.add(poi.id);
+          if (isPlayingPoiRef.current) {
+            poiQueueRef.current.push(poi);
+            console.log(`[Nav] ⏳ QUEUED "${poi.name}" (${poiQueueRef.current.length} in queue)`);
+          } else {
+            console.log(`[Nav] ✅ TRIGGER "${poi.name}" at ${dist.toFixed(0)}m`);
+            playPoiAudio(poi);
+          }
+          return;
+        }
+      }
+      if (shouldLog) {
+        console.log(
+          `[Nav] loc=(${location.lat.toFixed(5)},${location.lng.toFixed(5)}) ` +
+          `closest="${closestPoi?.name ?? "none"}" dist=${closestDist === Infinity ? "∞" : closestDist.toFixed(0) + "m"}`
+        );
+      }
+    };
+
+    // Register listeners immediately
+    setOnLocationChanged(handleLocationUpdate);
+
+    // ── Async navigation setup (single destination — clean route) ──
     const startNavigation = async () => {
       try {
         const termsAccepted = await navigationController.areTermsAccepted();
@@ -379,12 +601,10 @@ export default function HomeScreen() {
         }
         if (cancelled) return;
 
-        // init() is idempotent — calling it on an already-initialized navigator is a no-op
         const status = await navigationController.init();
         console.log("Nav init status:", status);
         if (cancelled) return;
 
-        // Short settle delay so the native navigator is ready for setDestination
         await new Promise((resolve) => setTimeout(resolve, 500));
         if (cancelled) return;
 
@@ -398,8 +618,9 @@ export default function HomeScreen() {
         await navigationController.startGuidance();
         navigationController.setAudioGuidanceType(AudioGuidance.SILENT);
 
-        // Start GPS streaming — required for setOnLocationChanged to fire.
-        // Without this the listener is registered but receives no events.
+        // Enable location event emission BEFORE simulator — this registers
+        // the listener and sets the flag. Must happen before simulator starts
+        // so resetFreeNav() doesn't interfere with simulated locations.
         try {
           navigationController.startUpdatingLocation();
           console.log("Nav location updates started");
@@ -407,103 +628,9 @@ export default function HomeScreen() {
           console.warn("startUpdatingLocation failed:", e);
         }
 
-        // Register geofencing listener right here (not in a separate effect)
-        // so it's set up ONCE per drive and doesn't churn on tourPois updates.
-        // The listener reads tourPois from a ref so it always sees current data.
-        const TRIGGER_RADIUS_M = 200;
-        const haversine = (lat1: number, lng1: number, lat2: number, lng2: number) => {
-          const R = 6371000;
-          const dLat = ((lat2 - lat1) * Math.PI) / 180;
-          const dLng = ((lng2 - lng1) * Math.PI) / 180;
-          const a = Math.sin(dLat / 2) ** 2 +
-            Math.cos((lat1 * Math.PI) / 180) * Math.cos((lat2 * Math.PI) / 180) * Math.sin(dLng / 2) ** 2;
-          return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-        };
-
-        // Plays a POI narration, waits for it to finish + a silent gap,
-        // then pulls the next queued POI and plays it. This prevents narrations
-        // from interrupting each other when POIs are close together.
-        const playPoiAudio = async (poi: any) => {
-          isPlayingPoiRef.current = true;
-          try {
-            if (bgMusicRef.current) await bgMusicRef.current.setVolumeAsync(0.08);
-            if (soundRef.current) {
-              try { await soundRef.current.unloadAsync(); } catch {}
-            }
-            const { sound } = await Audio.Sound.createAsync(
-              { uri: poi.audio_url },
-              { shouldPlay: true }
-            );
-            soundRef.current = sound;
-            sound.setOnPlaybackStatusUpdate((status: any) => {
-              if (status.isLoaded && status.didJustFinish) {
-                // After the narration ends, restore music, wait a beat, then
-                // play the next queued POI if one is waiting.
-                bgMusicRef.current?.setVolumeAsync(0.4);
-                setTimeout(() => {
-                  const next = poiQueueRef.current.shift();
-                  if (next) {
-                    console.log(`[Geofence] ▶ Playing queued "${next.name}"`);
-                    playPoiAudio(next);
-                  } else {
-                    isPlayingPoiRef.current = false;
-                  }
-                }, POI_GAP_MS);
-              }
-            });
-          } catch (e: any) {
-            console.warn(`[Geofence] POI audio failed for "${poi.name}":`, e?.message || e);
-            // Don't strand the queue on a failure — try the next one
-            isPlayingPoiRef.current = false;
-            const next = poiQueueRef.current.shift();
-            if (next) playPoiAudio(next);
-          }
-        };
-
-        let logCounter = 0;
-        setOnLocationChanged((location: any) => {
-          const pois = tourPoisRef.current;
-          if (pois.length === 0) return;
-
-          logCounter++;
-          const shouldLog = logCounter % 10 === 0;
-
-          let closestDist = Infinity;
-          let closestPoi: any = null;
-          for (const poi of pois) {
-            if (triggeredPoisRef.current.has(poi.id)) continue;
-            if (!poi.audio_url) continue;
-            const dist = haversine(location.lat, location.lng, poi.lat, poi.lng);
-            if (dist < closestDist) {
-              closestDist = dist;
-              closestPoi = poi;
-            }
-            if (dist <= TRIGGER_RADIUS_M) {
-              triggeredPoisRef.current.add(poi.id);
-              if (isPlayingPoiRef.current) {
-                // Something is playing — queue this POI to play after
-                poiQueueRef.current.push(poi);
-                console.log(
-                  `[Geofence] ⏳ QUEUED "${poi.name}" (${poiQueueRef.current.length} in queue)`
-                );
-              } else {
-                console.log(`[Geofence] ✅ TRIGGER "${poi.name}" at ${dist.toFixed(0)}m`);
-                playPoiAudio(poi);
-              }
-              return;
-            }
-          }
-          if (shouldLog) {
-            console.log(
-              `[Geofence] loc=(${location.lat.toFixed(5)},${location.lng.toFixed(5)}) ` +
-              `closest="${closestPoi?.name ?? "none"}" dist=${closestDist === Infinity ? "∞" : closestDist.toFixed(0) + "m"}`
-            );
-          }
-        });
-
-        // DEV ONLY — simulate driving along the calculated route so you can
-        // test the driving experience while stationary. Set SIMULATE_DRIVING
-        // to false (or remove) for real-device production use.
+        // DEV ONLY — simulate driving along the calculated route.
+        // Started AFTER startUpdatingLocation so the simulator overrides
+        // the location source with simulated positions.
         const SIMULATE_DRIVING = false;
         if (SIMULATE_DRIVING && !cancelled) {
           try {
@@ -516,25 +643,17 @@ export default function HomeScreen() {
           }
         }
 
-        // Apply the tilted follow perspective immediately so the puck becomes
-        // a chevron right away. Re-apply it after a short delay so it takes
-        // effect after guidance is fully running and the first location update
-        // has landed — otherwise the SDK falls back to a blue dot.
         if (navViewControllerRef.current) {
           navViewControllerRef.current.setFollowingPerspective(CameraPerspective.TILTED);
         }
         setTimeout(() => {
           if (!cancelled && navViewControllerRef.current) {
-            try {
-              navViewControllerRef.current.setFollowingPerspective(CameraPerspective.TILTED);
-            } catch {}
+            try { navViewControllerRef.current.setFollowingPerspective(CameraPerspective.TILTED); } catch {}
           }
         }, 800);
         setTimeout(() => {
           if (!cancelled && navViewControllerRef.current) {
-            try {
-              navViewControllerRef.current.setFollowingPerspective(CameraPerspective.TILTED);
-            } catch {}
+            try { navViewControllerRef.current.setFollowingPerspective(CameraPerspective.TILTED); } catch {}
           }
         }, 2500);
       } catch (e) {
@@ -546,8 +665,6 @@ export default function HomeScreen() {
 
     return () => {
       cancelled = true;
-      // Unregister the location listener first so we don't receive events
-      // during teardown
       try { setOnLocationChanged(null); } catch {}
       try { navigationController.simulator.stopLocationSimulation(); } catch {}
       try { navigationController.stopUpdatingLocation(); } catch {}
@@ -588,8 +705,6 @@ export default function HomeScreen() {
 
       const poisData = await api.getPois(data.polyline, data.durationSec);
       setPois(poisData.pois || []);
-
-      togglePanel(false);
     } catch (err: any) {
       Alert.alert("Error", err.message || "Failed to get directions");
     } finally {
@@ -597,154 +712,266 @@ export default function HomeScreen() {
     }
   };
 
-  const handleGenerateTour = async () => {
-    if (!routeData) return;
+  // handleGenerateTour is now merged into handleStartTour — no separate step needed.
 
-    setLoadingTour(true);
-    try {
-      const saved = await api.saveRoute({
-        originAddress: origin,
-        originLat: routeData.originLat,
-        originLng: routeData.originLng,
-        destinationAddress: destination,
-        destinationLat: routeData.destinationLat,
-        destinationLng: routeData.destinationLng,
-        polyline: routeData.polyline,
-        totalDistanceM: routeData.distanceM,
-        totalDurationSec: routeData.durationSec,
-        pois: pois.map((p: any) => ({
-          placeId: p.placeId || p.place_id,
-          name: p.name,
-          types: p.types || [],
-          location: p.location,
-          rating: p.rating || null,
-          userRatingsTotal: p.userRatingsTotal || p.user_ratings_total || 0,
-          vicinity: p.vicinity || "",
-        })),
-      });
+  // Start a sim tour (skip proximity check, go straight to tour page simulator)
+  const handleSimTour = useCallback(async () => {
+    // Ensure the tour is generated first
+    let currentRouteId = routeId;
+    if (!currentRouteId && routeData) {
+      setLoadingTour(true);
+      setTourLoadingLabel("Generating Tour...");
+      try {
+        const saved = await api.saveRoute({
+          originAddress: origin,
+          originLat: routeData.originLat,
+          originLng: routeData.originLng,
+          destinationAddress: destination,
+          destinationLat: routeData.destinationLat,
+          destinationLng: routeData.destinationLng,
+          polyline: routeData.polyline,
+          totalDistanceM: routeData.distanceM,
+          totalDurationSec: routeData.durationSec,
+          pois: pois.map((p: any) => ({
+            placeId: p.placeId || p.place_id,
+            name: p.name,
+            types: p.types || [],
+            location: p.location,
+            rating: p.rating || null,
+            userRatingsTotal: p.userRatingsTotal || p.user_ratings_total || 0,
+            vicinity: p.vicinity || "",
+          })),
+        });
+        currentRouteId = saved.routeId;
+        setRouteId(saved.routeId);
+        await api.generateTour(saved.routeId);
 
-      setRouteId(saved.routeId);
-      await api.generateTour(saved.routeId);
-
-      const pollInterval = setInterval(async () => {
-        try {
-          const status = await api.getTourStatus(saved.routeId);
-          if (status.status === "ready") {
-            clearInterval(pollInterval);
-            setTourReady(true);
-            setLoadingTour(false);
-          } else if (status.status === "failed") {
-            clearInterval(pollInterval);
-            setLoadingTour(false);
-            Alert.alert("Error", "Tour generation failed. Please try again.");
-          }
-        } catch (e) {
-          console.warn("Tour status poll error:", e);
-        }
-      }, 3000);
-    } catch (err: any) {
-      Alert.alert("Error", err.message || "Failed to generate tour");
+        // Poll until ready
+        await new Promise<void>((resolve, reject) => {
+          const poll = setInterval(async () => {
+            try {
+              const st = await api.getTourStatus(currentRouteId!);
+              if (st.status === "ready") { clearInterval(poll); resolve(); }
+              else if (st.status === "failed") { clearInterval(poll); reject(new Error("Tour generation failed")); }
+            } catch {}
+          }, 3000);
+        });
+      } catch (e: any) {
+        Alert.alert("Error", e?.message || "Failed to generate tour");
+        setLoadingTour(false);
+        return;
+      }
       setLoadingTour(false);
     }
-  };
+    if (currentRouteId) {
+      router.push(`/tour/${currentRouteId}`);
+    }
+  }, [routeId, routeData, origin, destination, pois, router]);
+
+  const PROXIMITY_RADIUS_M = 5;
 
   const handleStartTour = async () => {
-    if (!routeId) return;
+    if (!routeData) return;
 
-    // Re-draw overlays for driving mode: hide the green origin marker (user is
-    // there, don't cover their real location puck) and hide our static gradient
-    // polyline (Nav SDK draws its own live route line). Keep POI + destination
-    // markers so the user can see upcoming stops during the drive.
-    drawRouteOnMap({ hideOrigin: true, hidePolyline: true, fitCamera: false })
-      .catch((e) => console.warn("Drive-mode draw failed:", e));
+    // Proximity check — user must be within 5m of the starting point for live driving.
+    // Skip if origin is "Current Location" — user is already there by definition.
+    if (origin !== "Current Location") {
+    try {
+      const { status } = await Location.requestForegroundPermissionsAsync();
+      if (status === "granted") {
+        setLoadingTour(true);
+        setTourLoadingLabel("Checking location...");
+        const loc = await Location.getCurrentPositionAsync({});
+        const distToOrigin = (() => {
+          const R = 6371000;
+          const dLat = ((routeData.originLat - loc.coords.latitude) * Math.PI) / 180;
+          const dLng = ((routeData.originLng - loc.coords.longitude) * Math.PI) / 180;
+          const a = Math.sin(dLat / 2) ** 2 +
+            Math.cos((loc.coords.latitude * Math.PI) / 180) * Math.cos((routeData.originLat * Math.PI) / 180) * Math.sin(dLng / 2) ** 2;
+          return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+        })();
 
-    // Switch to driving mode IMMEDIATELY — audio + data load in the background below
-    togglePanel(false);
-    setIsDriving(true);
-
-    // Configure audio mode (quick, non-blocking)
-    Audio.setAudioModeAsync({
-      allowsRecordingIOS: false,
-      staysActiveInBackground: true,
-      playsInSilentModeIOS: true,
-    }).catch(() => {});
-
-    triggeredPoisRef.current = new Set();
-    poiQueueRef.current = [];
-    isPlayingPoiRef.current = false;
-
-    // Fetch route row + POI data in parallel — don't block UI transition
-    (async () => {
-      try {
-        const [routeResult, poiResult] = await Promise.all([
-          supabase
-            .from("routes")
-            .select("welcome_audio_url, music_track_id")
-            .eq("id", routeId)
-            .single(),
-          supabase
-            .from("route_pois")
-            .select("id, name, lat, lng, audio_url, audio_duration_sec, is_neighborhood_intro")
-            .eq("route_id", routeId)
-            .order("sequence_order", { ascending: true }),
-        ]);
-
-        const routeRow = routeResult.data;
-        const poiRows = poiResult.data;
-
-        if (poiRows) setTourPois(poiRows);
-
-        // Welcome audio + background music — fire both in parallel so whichever is ready first plays
-        if (routeRow?.welcome_audio_url) {
-          (async () => {
-            try {
-              if (soundRef.current) await soundRef.current.unloadAsync();
-              const { sound } = await Audio.Sound.createAsync(
-                { uri: routeRow.welcome_audio_url },
-                { shouldPlay: true }
-              );
-              soundRef.current = sound;
-              sound.setOnPlaybackStatusUpdate((status: any) => {
-                if (status.isLoaded && status.didJustFinish) {
-                  bgMusicRef.current?.setVolumeAsync(0.4);
-                }
-              });
-              bgMusicRef.current?.setVolumeAsync(0.08);
-            } catch (e: any) {
-              console.warn("Welcome audio failed:", e?.message || e);
-            }
-          })();
+        if (distToOrigin > PROXIMITY_RADIUS_M) {
+          setLoadingTour(false);
+          Alert.alert(
+            "Too Far from Starting Point",
+            `You must be within ${PROXIMITY_RADIUS_M} meters of the starting point to begin a live tour. You are currently ${Math.round(distToOrigin)}m away.`,
+            [
+              { text: "Cancel", style: "cancel" },
+              {
+                text: "Begin Sim Tour",
+                onPress: () => handleSimTour(),
+              },
+            ]
+          );
+          return;
         }
-
-        if (routeRow?.music_track_id) {
-          (async () => {
-            try {
-              const { data: musicData, error: musicErr } = await supabase
-                .from("music_tracks")
-                .select("audio_url")
-                .eq("id", routeRow.music_track_id)
-                .single();
-              if (musicErr) {
-                console.warn("Music track lookup failed:", musicErr.message);
-              } else if (musicData?.audio_url) {
-                const { sound: music } = await Audio.Sound.createAsync(
-                  { uri: musicData.audio_url },
-                  { shouldPlay: true, isLooping: true, volume: 0.4 }
-                );
-                bgMusicRef.current = music;
-                console.log("Background music started");
-              }
-            } catch (e: any) {
-              console.warn("Background music failed:", e?.message || e);
-            }
-          })();
-        } else {
-          console.log("No music_track_id on this route");
-        }
-      } catch (e) {
-        console.warn("Start tour data fetch failed:", e);
       }
-    })();
+    } catch (e) {
+      console.warn("Proximity check failed:", e);
+      // If location check fails, let them proceed anyway
+    }
+    } // end origin !== "Current Location" check
+
+    try {
+      // If tour was already generated (e.g. re-entering after exit driving),
+      // skip straight to pre-loading audio — no need to regenerate.
+      let currentRouteId = routeId;
+      if (currentRouteId) {
+        // Tour already exists — jump to audio pre-loading
+        setLoadingTour(true);
+        setTourLoadingLabel("Preparing Audio...");
+      } else {
+        // First time — need to generate
+        setLoadingTour(true);
+        setTourLoadingLabel("Generating Tour...");
+        const saved = await api.saveRoute({
+          originAddress: origin,
+          originLat: routeData.originLat,
+          originLng: routeData.originLng,
+          destinationAddress: destination,
+          destinationLat: routeData.destinationLat,
+          destinationLng: routeData.destinationLng,
+          polyline: routeData.polyline,
+          totalDistanceM: routeData.distanceM,
+          totalDurationSec: routeData.durationSec,
+          pois: pois.map((p: any) => ({
+            placeId: p.placeId || p.place_id,
+            name: p.name,
+            types: p.types || [],
+            location: p.location,
+            rating: p.rating || null,
+            userRatingsTotal: p.userRatingsTotal || p.user_ratings_total || 0,
+            vicinity: p.vicinity || "",
+          })),
+        });
+        currentRouteId = saved.routeId;
+        setRouteId(saved.routeId);
+        await api.generateTour(saved.routeId);
+
+        // Poll until tour is ready
+        await new Promise<void>((resolve, reject) => {
+          const pollInterval = setInterval(async () => {
+            try {
+              const status = await api.getTourStatus(currentRouteId!);
+              if (status.status === "ready") {
+                clearInterval(pollInterval);
+                resolve();
+              } else if (status.status === "failed") {
+                clearInterval(pollInterval);
+                reject(new Error("Tour generation failed"));
+              }
+            } catch {}
+          }, 3000);
+        });
+      }
+
+      // Pre-download audio (runs for both new and existing tours)
+      setTourLoadingLabel("Preparing Audio...");
+      console.log("[Tour] Status ready — pre-downloading audio...");
+
+      const [routeResult, poiResult] = await Promise.all([
+        supabase.from("routes").select("welcome_audio_url, music_track_id").eq("id", currentRouteId!).single(),
+        supabase.from("route_pois")
+          .select("id, name, lat, lng, types, place_id, audio_url, audio_duration_sec, is_neighborhood_intro")
+          .eq("route_id", currentRouteId!)
+          .order("sequence_order", { ascending: true }),
+      ]);
+
+      const routeRow = routeResult.data;
+      const poiRows = poiResult.data || [];
+
+      // Pre-load welcome audio
+      let welcomeSound: Audio.Sound | null = null;
+      if (routeRow?.welcome_audio_url) {
+        try {
+          const { sound } = await Audio.Sound.createAsync({ uri: routeRow.welcome_audio_url }, { shouldPlay: false });
+          welcomeSound = sound;
+        } catch {}
+      }
+
+      // Pre-load music
+      let musicSound: Audio.Sound | null = null;
+      if (routeRow?.music_track_id) {
+        try {
+          const { data: musicData } = await supabase.from("music_tracks").select("audio_url").eq("id", routeRow.music_track_id).single();
+          if (musicData?.audio_url) {
+            const { sound: music } = await Audio.Sound.createAsync({ uri: musicData.audio_url }, { shouldPlay: false, isLooping: true, volume: 0.4 });
+            musicSound = music;
+          }
+        } catch {}
+      }
+
+      // Step 4: Verify POIs are fully loaded before entering driving mode
+      const poisWithAudio = poiRows.filter((p: any) => p.audio_url);
+      console.log(`[Tour] POIs loaded: ${poiRows.length} total, ${poisWithAudio.length} with audio`);
+
+      // If no POIs have audio yet, re-fetch with a short wait (background generation may still be running)
+      let finalPoiRows = poiRows;
+      if (poiRows.length > 0 && poisWithAudio.length === 0) {
+        console.log("[Tour] No POIs have audio — waiting 3s and re-fetching...");
+        await new Promise((r) => setTimeout(r, 3000));
+        const { data: retryPois } = await supabase
+          .from("route_pois")
+          .select("id, name, lat, lng, types, place_id, audio_url, audio_duration_sec, is_neighborhood_intro")
+          .eq("route_id", currentRouteId!)
+          .order("sequence_order", { ascending: true });
+        if (retryPois && retryPois.length > 0) {
+          finalPoiRows = retryPois;
+          console.log(`[Tour] Retry: ${finalPoiRows.length} POIs, ${finalPoiRows.filter((p: any) => p.audio_url).length} with audio`);
+        }
+      }
+
+      // Load POI data + reset refs BEFORE setIsDriving so the nav effect
+      // (which registers the geofence listener) always sees populated data.
+      triggeredPoisRef.current = new Set();
+      poiQueueRef.current = [];
+      isPlayingPoiRef.current = false;
+      if (finalPoiRows.length > 0) {
+        setTourPois(finalPoiRows);
+        tourPoisRef.current = finalPoiRows; // set ref directly — don't wait for useEffect
+      }
+
+      await Audio.setAudioModeAsync({
+        allowsRecordingIOS: false,
+        staysActiveInBackground: true,
+        playsInSilentModeIOS: true,
+      }).catch(() => {});
+
+      setActiveTour(currentRouteId!, "driving");
+      // Don't call drawRouteOnMap here — the Nav SDK draws its own route line
+      // during guidance. Calling clearMapView() would interfere with the SDK's
+      // rendering and cause the route line to break.
+      togglePanel(false);
+      setIsDriving(true);
+
+      // Play music
+      if (musicSound) {
+        bgMusicRef.current = musicSound;
+        try { await musicSound.playAsync(); } catch {}
+      }
+
+      // Play welcome audio
+      if (welcomeSound) {
+        soundRef.current = welcomeSound;
+        welcomeSound.setOnPlaybackStatusUpdate((status: any) => {
+          if (status.isLoaded && status.didJustFinish) {
+            try { bgMusicRef.current?.setVolumeAsync(0.4); } catch {}
+          }
+        });
+        try {
+          await bgMusicRef.current?.setVolumeAsync(0.08);
+          await welcomeSound.playAsync();
+        } catch {}
+      }
+
+      console.log("[Tour] Driving mode started");
+    } catch (e: any) {
+      Alert.alert("Error", e?.message || "Failed to start tour");
+    } finally {
+      setLoadingTour(false);
+      setTourLoadingLabel("Generating Tour...");
+    }
   };
 
   const handleExitDriving = useCallback(async () => {
@@ -752,6 +979,9 @@ export default function HomeScreen() {
     // onNavigationViewControllerCreated only fires once. Resetting navViewReady
     // would block the next Start Tour from entering driving mode.
     setIsDriving(false);
+    clearActiveTour();
+    setCurrentDrivingPoi(null);
+    setPoiPanelExpanded(true);
 
     // Clear POI audio queue + reset playing flag so a fresh Start Tour starts clean
     poiQueueRef.current = [];
@@ -788,6 +1018,40 @@ export default function HomeScreen() {
     }, 500);
   }, [routeData, userLoc, drawRouteOnMap]);
 
+  const handleTogglePause = useCallback(async () => {
+    if (tourPaused) {
+      // Resume
+      try { await soundRef.current?.playAsync(); } catch {}
+      try { await bgMusicRef.current?.playAsync(); } catch {}
+      try { navigationController.simulator.resumeLocationSimulation(); } catch {}
+      setTourPaused(false);
+    } else {
+      // Pause
+      try { await soundRef.current?.pauseAsync(); } catch {}
+      try { await bgMusicRef.current?.pauseAsync(); } catch {}
+      try { navigationController.simulator.pauseLocationSimulation(); } catch {}
+      setTourPaused(true);
+    }
+  }, [tourPaused, navigationController]);
+
+  const handleEndTour = useCallback(() => {
+    Alert.alert(
+      "End Tour",
+      "Are you sure you want to end this tour?",
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "End Tour",
+          style: "destructive",
+          onPress: () => {
+            setTourPaused(false);
+            handleExitDriving();
+          },
+        },
+      ]
+    );
+  }, [handleExitDriving]);
+
   if (authLoading) {
     return (
       <View style={[styles.center, { backgroundColor: theme.background }]}>
@@ -806,20 +1070,90 @@ export default function HomeScreen() {
           navViewControllerRef.current = controller;
           setNavViewReady(true);
         }}
-        mapColorScheme={isDark ? MapColorScheme.DARK : MapColorScheme.LIGHT}
+        mapId="da9e1e4ff9cfa0ff3017deab"
         headerEnabled={false}
         footerEnabled={false}
         speedometerEnabled={false}
-        recenterButtonEnabled={isDriving}
+        recenterButtonEnabled={false}
         navigationNightMode={isDark ? NavigationNightMode.FORCE_NIGHT : NavigationNightMode.FORCE_DAY}
         navigationUIEnabledPreference={isDriving ? NavigationUIEnabledPreference.AUTOMATIC : NavigationUIEnabledPreference.DISABLED}
       />
 
-      {/* Exit driving button */}
+      {/* Driving controls — Pause + End Tour */}
       {isDriving && (
-        <TouchableOpacity style={[styles.exitDrivingButton, { top: insets.top + 12 }]} onPress={handleExitDriving}>
-          <Text style={styles.exitDrivingText}>✕  Exit Driving</Text>
+        <View style={[styles.drivingControls, { top: insets.top + 12 }]}>
+          <TouchableOpacity style={styles.pauseButton} onPress={handleTogglePause}>
+            <Text style={styles.drivingControlText}>{tourPaused ? "▶  Resume" : "⏸  Pause"}</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={styles.endTourButton} onPress={handleEndTour}>
+            <Text style={styles.drivingControlText}>✕  End Tour</Text>
+          </TouchableOpacity>
+        </View>
+      )}
+
+      {/* Custom recenter button */}
+      {isDriving && (
+        <TouchableOpacity
+          style={styles.recenterButton}
+          onPress={() => {
+            if (navViewControllerRef.current) {
+              navViewControllerRef.current.setFollowingPerspective(CameraPerspective.TILTED);
+            }
+          }}
+          activeOpacity={0.7}
+        >
+          <Text style={styles.recenterText}>Re Center</Text>
         </TouchableOpacity>
+      )}
+
+      {/* POI detail panel during driving */}
+      {isDriving && (
+        <View style={[styles.poiPanel, {
+          backgroundColor: isDark ? colors.nearBlack : "#fff",
+          paddingBottom: poiPanelExpanded ? insets.bottom + 12 : 0,
+        }]}>
+          <TouchableOpacity
+            onPress={() => setPoiPanelExpanded(!poiPanelExpanded)}
+            activeOpacity={0.7}
+            style={styles.poiPanelHandleArea}
+          >
+            {poiPanelExpanded ? (
+              <View style={styles.poiPanelHandle} />
+            ) : (
+              <Text style={{ color: isDark ? "#aaa" : "#666", fontSize: 18 }}>▲</Text>
+            )}
+          </TouchableOpacity>
+
+          {poiPanelExpanded && (
+            <>
+              {currentDrivingPoi ? (
+                <>
+                  <Image
+                    source={{
+                      uri: poiPhotoUrl || `https://maps.googleapis.com/maps/api/staticmap?center=${currentDrivingPoi.lat},${currentDrivingPoi.lng}&zoom=17&size=600x200&maptype=roadmap&markers=color:0x0078FF|${currentDrivingPoi.lat},${currentDrivingPoi.lng}&key=${ENV.GOOGLE_MAPS_API_KEY}`,
+                    }}
+                    style={styles.poiPanelImage}
+                    resizeMode="cover"
+                  />
+                  <View style={styles.poiPanelInfo}>
+                    <Text style={[styles.poiPanelName, { color: theme.text }]} numberOfLines={1}>
+                      {currentDrivingPoi.name}
+                    </Text>
+                    <Text style={[styles.poiPanelDesc, { color: theme.textSecondary }]} numberOfLines={2}>
+                      {currentDrivingPoi.vicinity || currentDrivingPoi.types?.join(", ") || "Point of Interest"}
+                    </Text>
+                  </View>
+                </>
+              ) : (
+                <View style={styles.poiPanelInfo}>
+                  <Text style={[styles.poiPanelName, { color: theme.text }]}>
+                    {tourPois.length > 0 ? "Driving to next point..." : "Starting tour..."}
+                  </Text>
+                </View>
+              )}
+            </>
+          )}
+        </View>
       )}
 
       {/* Expand button when collapsed */}
@@ -996,39 +1330,40 @@ export default function HomeScreen() {
           {!activeField && (
             !routeData ? (
               <TouchableOpacity
-                style={[styles.button, loadingRoute && styles.buttonDisabled]}
                 onPress={handleGetDirections}
                 disabled={loadingRoute}
+                activeOpacity={0.8}
               >
-                {loadingRoute ? (
-                  <ActivityIndicator color="#fff" />
-                ) : (
-                  <Text style={styles.buttonText}>Get Directions</Text>
-                )}
+                <LinearGradient
+                  colors={["#7C5CFC", "#0078FF"]}
+                  start={{ x: 0, y: 0 }}
+                  end={{ x: 1, y: 0 }}
+                  style={[styles.button, loadingRoute && styles.buttonDisabled]}
+                >
+                  {loadingRoute ? (
+                    <ActivityIndicator color="#fff" />
+                  ) : (
+                    <Text style={styles.buttonText}>Create Tour</Text>
+                  )}
+                </LinearGradient>
               </TouchableOpacity>
-            ) : tourReady ? (
+            ) : routeData ? (
               <TouchableOpacity
-                style={[styles.button, { backgroundColor: colors.magicGreen }]}
+                style={[styles.button, { backgroundColor: colors.magicGreen }, (loadingTour && !tourReady) && styles.buttonDisabled]}
                 onPress={handleStartTour}
+                disabled={loadingTour && !tourReady}
+                activeOpacity={0.8}
               >
-                <Text style={styles.buttonText}>Start Tour</Text>
-              </TouchableOpacity>
-            ) : (
-              <TouchableOpacity
-                style={[styles.button, loadingTour && styles.buttonDisabled]}
-                onPress={handleGenerateTour}
-                disabled={loadingTour}
-              >
-                {loadingTour ? (
+                {loadingTour && !tourReady ? (
                   <View style={styles.loadingRow}>
                     <ActivityIndicator color="#fff" size="small" />
-                    <Text style={[styles.buttonText, { marginLeft: 8 }]}>Generating Tour...</Text>
+                    <Text style={[styles.buttonText, { marginLeft: 8 }]}>{tourLoadingLabel}</Text>
                   </View>
                 ) : (
-                  <Text style={styles.buttonText}>Generate Audio Tour</Text>
+                  <Text style={styles.buttonText}>Start Tour</Text>
                 )}
               </TouchableOpacity>
-            )
+            ) : null
           )}
         </Animated.View>
       )}
@@ -1182,20 +1517,111 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     alignItems: "center",
   },
-  exitDrivingButton: {
+  recenterButton: {
     position: "absolute",
-    left: 16,
-    backgroundColor: "rgba(0,0,0,0.7)",
-    borderRadius: 24,
-    paddingHorizontal: 16,
+    right: 16,
+    bottom: 240,
+    borderRadius: 20,
+    paddingHorizontal: 14,
     paddingVertical: 10,
-    flexDirection: "row",
+    backgroundColor: "rgba(0,0,0,0.7)",
+    justifyContent: "center",
     alignItems: "center",
     zIndex: 100,
   },
-  exitDrivingText: {
+  recenterText: {
+    color: "#fff",
+    fontSize: 12,
+    fontWeight: "600",
+  },
+  drivingControls: {
+    position: "absolute",
+    left: 16,
+    flexDirection: "row",
+    gap: 8,
+    zIndex: 100,
+  },
+  pauseButton: {
+    backgroundColor: "rgba(0,0,0,0.7)",
+    borderRadius: 24,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+  },
+  endTourButton: {
+    backgroundColor: "rgba(180,40,40,0.85)",
+    borderRadius: 24,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+  },
+  drivingControlText: {
     color: "#fff",
     fontSize: fontSize.sm,
     fontWeight: "600",
+  },
+  poiPanel: {
+    position: "absolute",
+    bottom: 0,
+    left: 0,
+    right: 0,
+    borderTopLeftRadius: 20,
+    borderTopRightRadius: 20,
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: -2 },
+    shadowOpacity: 0.15,
+    shadowRadius: 10,
+    elevation: 10,
+    paddingHorizontal: spacing.md,
+  },
+  poiPanelHandleArea: {
+    paddingVertical: 8,
+    alignItems: "center",
+  },
+  poiPanelHandle: {
+    width: 40,
+    height: 4,
+    backgroundColor: "#ccc",
+    borderRadius: 2,
+  },
+  poiPanelImage: {
+    width: "100%",
+    height: 140,
+    borderRadius: borderRadius.md,
+    marginBottom: spacing.sm,
+    backgroundColor: "#333",
+  },
+  poiPanelInfo: {
+    paddingBottom: spacing.sm,
+  },
+  poiPanelName: {
+    fontSize: fontSize.lg,
+    fontWeight: "700",
+  },
+  poiPanelDesc: {
+    fontSize: fontSize.sm,
+    marginTop: 4,
+    lineHeight: 18,
+  },
+  compassButton: {
+    position: "absolute",
+    right: 16,
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: "rgba(0,0,0,0.6)",
+    justifyContent: "center",
+    alignItems: "center",
+    zIndex: 50,
+  },
+  compassText: {
+    color: "#fff",
+    fontSize: 11,
+    fontWeight: "700",
+  },
+  compassNeedle: {
+    width: 2,
+    height: 8,
+    backgroundColor: colors.errorRed,
+    borderRadius: 1,
+    marginTop: -2,
   },
 });

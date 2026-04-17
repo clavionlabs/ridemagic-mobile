@@ -36,7 +36,7 @@ export async function getPlaceSuggestions(input: string, userLocation?: { lat: n
 }
 
 // Decode polyline to array of {lat, lng}
-function decodePolyline(encoded: string): Array<{ lat: number; lng: number }> {
+export function decodePolyline(encoded: string): Array<{ lat: number; lng: number }> {
   const points: Array<{ lat: number; lng: number }> = [];
   let index = 0, lat = 0, lng = 0;
   while (index < encoded.length) {

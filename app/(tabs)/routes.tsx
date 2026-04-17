@@ -1,4 +1,5 @@
-import { useEffect, useState } from "react";
+import { useState, useCallback } from "react";
+import { useFocusEffect } from "expo-router";
 import {
   View,
   Text,
@@ -12,6 +13,7 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import { colors, fontSize, spacing, borderRadius } from "../../src/theme";
 import { useAuth } from "../../src/hooks/useAuth";
 import { useTheme } from "../../src/hooks/useTheme";
+import { useActiveTour } from "../../src/hooks/useActiveTour";
 import { supabase } from "../../src/lib/supabase";
 
 interface Route {
@@ -55,44 +57,46 @@ export default function RoutesScreen() {
   const { isDark, theme } = useTheme();
   const router = useRouter();
   const { user } = useAuth();
+  const { activeTourId, activeTourMode } = useActiveTour();
   const [routes, setRoutes] = useState<Route[]>([]);
   const [loading, setLoading] = useState(true);
 
-  useEffect(() => {
+  // Refetch every time this tab becomes visible (not just on mount)
+  const fetchRoutes = useCallback(async () => {
     if (!user) return;
+    setLoading(true);
 
-    async function fetchRoutes() {
-      const { data } = await supabase
-        .from("routes")
-        .select(
-          "id, origin_address, destination_address, total_distance_m, total_duration_sec, tour_theme, tour_summary, status, created_at"
-        )
-        .eq("user_id", user!.id)
-        .eq("status", "ready")
-        .order("created_at", { ascending: false });
+    const { data } = await supabase
+      .from("routes")
+      .select(
+        "id, origin_address, destination_address, total_distance_m, total_duration_sec, tour_theme, tour_summary, status, created_at"
+      )
+      .eq("user_id", user!.id)
+      .eq("status", "ready")
+      .order("created_at", { ascending: false });
 
-      if (data && data.length > 0) {
-        // Get POI counts
-        const routeIds = data.map((r: Route) => r.id);
-        const { data: poiData } = await supabase
-          .from("route_pois")
-          .select("route_id")
-          .in("route_id", routeIds);
+    if (data && data.length > 0) {
+      const routeIds = data.map((r: Route) => r.id);
+      const { data: poiData } = await supabase
+        .from("route_pois")
+        .select("route_id")
+        .in("route_id", routeIds);
 
-        const poiCounts: Record<string, number> = {};
-        poiData?.forEach((p: { route_id: string }) => {
-          poiCounts[p.route_id] = (poiCounts[p.route_id] || 0) + 1;
-        });
+      const poiCounts: Record<string, number> = {};
+      poiData?.forEach((p: { route_id: string }) => {
+        poiCounts[p.route_id] = (poiCounts[p.route_id] || 0) + 1;
+      });
 
-        setRoutes(
-          data.map((r: Route) => ({ ...r, poi_count: poiCounts[r.id] || 0 }))
-        );
-      }
-      setLoading(false);
+      setRoutes(
+        data.map((r: Route) => ({ ...r, poi_count: poiCounts[r.id] || 0 }))
+      );
+    } else {
+      setRoutes([]);
     }
-
-    fetchRoutes();
+    setLoading(false);
   }, [user]);
+
+  useFocusEffect(useCallback(() => { fetchRoutes(); }, [fetchRoutes]));
 
   const renderRoute = ({ item, index }: { item: Route; index: number }) => {
     const originShort = item.origin_address.split(",")[0];
@@ -143,12 +147,36 @@ export default function RoutesScreen() {
             ) : null}
           </View>
 
-          <TouchableOpacity
-            style={styles.viewButton}
-            onPress={() => router.push(`/tour/${item.id}`)}
-          >
-            <Text style={styles.viewButtonText}>View Tour</Text>
-          </TouchableOpacity>
+          {activeTourId === item.id && activeTourMode === "driving" ? (
+            <TouchableOpacity
+              style={[styles.viewButton, { backgroundColor: colors.magicGreen }]}
+              onPress={() => router.push("/(tabs)")}
+            >
+              <Text style={styles.viewButtonText}>Resume Driving</Text>
+            </TouchableOpacity>
+          ) : activeTourId === item.id && activeTourMode === "simulating" ? (
+            <TouchableOpacity
+              style={[styles.viewButton, { backgroundColor: colors.sunsetOrange }]}
+              onPress={() => router.push(`/tour/${item.id}`)}
+            >
+              <Text style={styles.viewButtonText}>Now Playing</Text>
+            </TouchableOpacity>
+          ) : (
+            <View style={styles.buttonRow}>
+              <TouchableOpacity
+                style={[styles.tourButton, { backgroundColor: colors.magicGreen }]}
+                onPress={() => router.push({ pathname: "/(tabs)", params: { liveTourId: item.id } })}
+              >
+                <Text style={styles.viewButtonText}>Live Tour</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.tourButton, { backgroundColor: colors.rideBlue }]}
+                onPress={() => router.push(`/tour/${item.id}`)}
+              >
+                <Text style={styles.viewButtonText}>Sim Tour</Text>
+              </TouchableOpacity>
+            </View>
+          )}
         </View>
       </View>
     );
@@ -256,6 +284,16 @@ const styles = StyleSheet.create({
   },
   viewButton: {
     backgroundColor: colors.rideBlue,
+    borderRadius: borderRadius.md,
+    paddingVertical: 10,
+    alignItems: "center",
+  },
+  buttonRow: {
+    flexDirection: "row",
+    gap: spacing.sm,
+  },
+  tourButton: {
+    flex: 1,
     borderRadius: borderRadius.md,
     paddingVertical: 10,
     alignItems: "center",
