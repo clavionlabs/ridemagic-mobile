@@ -11,16 +11,16 @@ import { MapView } from "@googlemaps/react-native-navigation-sdk";
 import type { MapViewController } from "@googlemaps/react-native-navigation-sdk";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
-import { Audio } from "expo-av";
+import { Audio, InterruptionModeIOS, InterruptionModeAndroid } from "expo-av";
 import { LinearGradient } from "expo-linear-gradient";
 import { activateKeepAwakeAsync, deactivateKeepAwake } from "expo-keep-awake";
-import { ENV } from "../../src/config/env";
-import { colors, fontSize, spacing, borderRadius } from "../../src/theme";
-import { getMarkerPaths } from "../../src/lib/markerAssets";
-import { useAuth } from "../../src/hooks/useAuth";
-import { useTheme } from "../../src/hooks/useTheme";
-import { useActiveTour } from "../../src/hooks/useActiveTour";
-import { supabase } from "../../src/lib/supabase";
+import { ENV } from "../../../src/config/env";
+import { colors, fontSize, spacing, borderRadius } from "../../../src/theme";
+import { getMarkerPaths } from "../../../src/lib/markerAssets";
+import { useAuth } from "../../../src/hooks/useAuth";
+import { useTheme } from "../../../src/hooks/useTheme";
+import { useActiveTour } from "../../../src/hooks/useActiveTour";
+import { supabase } from "../../../src/lib/supabase";
 
 // ─── Helpers ────────────────────────────────────────────────
 
@@ -175,7 +175,7 @@ const SIM_TICK_MS = 50; // update chevron position every 50ms
 // ─── Component ──────────────────────────────────────────────
 
 export default function TourScreen() {
-  const { id } = useLocalSearchParams<{ id: string }>();
+  const { id, from } = useLocalSearchParams<{ id: string; from?: string }>();
   const { isDark, theme } = useTheme();
   const router = useRouter();
   const { user } = useAuth();
@@ -272,65 +272,127 @@ export default function TourScreen() {
     const controller = mapControllerRef.current;
     if (!controller || !mapReady || decodedPath.length < 2 || !route) return;
 
+    let cancelled = false;
+
+    // All map controller methods return promises that reject if the native
+    // map view isn't fully initialized (or is being torn down). We wrap each
+    // call with a helper that silently swallows those rejections — try/catch
+    // can't catch rejections from non-awaited promises.
+    const safe = <T,>(p: T | Promise<T> | void): Promise<T | void> => {
+      return Promise.resolve(p as any).catch(() => undefined);
+    };
+
     const timer = setTimeout(async () => {
+      if (cancelled) return;
+      // Clear any previous polylines/markers before drawing
+      await safe(controller.clearMapView() as any);
+      if (cancelled) return;
+
       // Gradient polyline
-      try {
-        const totalSegs = decodedPath.length - 1;
-        const batchSize = Math.max(1, Math.floor(totalSegs / 40));
-        for (let i = 0; i < totalSegs; i += batchSize) {
-          const end = Math.min(i + batchSize + 1, decodedPath.length);
-          const factor = i / totalSegs;
-          const color = getGradientColor(factor);
-          await controller.addPolyline({
-            points: decodedPath.slice(i, end),
-            color,
-            width: 5,
-          });
-        }
-      } catch (e) { console.warn("Tour polyline failed:", e); }
+      const totalSegs = decodedPath.length - 1;
+      const batchSize = Math.max(1, Math.floor(totalSegs / 40));
+      for (let i = 0; i < totalSegs; i += batchSize) {
+        if (cancelled) return;
+        const end = Math.min(i + batchSize + 1, decodedPath.length);
+        const factor = i / totalSegs;
+        const color = getGradientColor(factor);
+        await safe(controller.addPolyline({
+          points: decodedPath.slice(i, end),
+          color,
+          width: 5,
+        }));
+      }
+
+      if (cancelled) return;
 
       // Markers
-      try {
-        const markers = getMarkerPaths();
-        await controller.addMarker({
-          position: { lat: route.origin_lat, lng: route.origin_lng },
-          title: "Start",
-          imgPath: markers.origin,
-        });
-        await controller.addMarker({
-          position: { lat: route.destination_lat, lng: route.destination_lng },
-          title: "Destination",
-          imgPath: markers.destination,
-        });
-        const visible = pois.filter((p) => !p.is_neighborhood_intro);
-        for (let i = 0; i < visible.length; i++) {
-          const poi = visible[i];
-          await controller.addMarker({
-            position: { lat: poi.lat, lng: poi.lng },
-            title: `${i + 1}. ${poi.name}`,
-            imgPath: markers.poiBlue,
-          });
-        }
-      } catch (e) { console.warn("Tour markers failed:", e); }
+      const markers = getMarkerPaths();
+      await safe(controller.addMarker({
+        position: { lat: route.origin_lat, lng: route.origin_lng },
+        title: "Start",
+        imgPath: markers.origin,
+      }));
+      if (cancelled) return;
+      await safe(controller.addMarker({
+        position: { lat: route.destination_lat, lng: route.destination_lng },
+        title: "Destination",
+        imgPath: markers.destination,
+      }));
+      const visible = pois.filter((p) => !p.is_neighborhood_intro);
+      for (let i = 0; i < visible.length; i++) {
+        if (cancelled) return;
+        const poi = visible[i];
+        await safe(controller.addMarker({
+          position: { lat: poi.lat, lng: poi.lng },
+          title: `${i + 1}. ${poi.name}`,
+          imgPath: markers.poiBlue,
+        }));
+      }
+
+      if (cancelled) return;
 
       // Fit to bounds
       const lats = decodedPath.map((p) => p.lat);
       const lngs = decodedPath.map((p) => p.lng);
-      try {
-        controller.moveCamera({
-          target: {
-            lat: (Math.min(...lats) + Math.max(...lats)) / 2,
-            lng: (Math.min(...lngs) + Math.max(...lngs)) / 2,
-          },
-          zoom: 12,
-          tilt: 0,
-          bearing: 0,
-        });
-      } catch {}
+      await safe(controller.moveCamera({
+        target: {
+          lat: (Math.min(...lats) + Math.max(...lats)) / 2,
+          lng: (Math.min(...lngs) + Math.max(...lngs)) / 2,
+        },
+        zoom: 12,
+        tilt: 0,
+        bearing: 0,
+      }));
     }, 1000);
 
-    return () => clearTimeout(timer);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+      // Clear on unmount. Use the same safe wrapper so a reject during teardown
+      // (common when the native map view is being torn down) doesn't leak.
+      const c = mapControllerRef.current;
+      if (c) {
+        Promise.resolve(c.clearMapView() as any).catch(() => undefined);
+      }
+    };
   }, [decodedPath, pois, route, mapReady]);
+
+  // Robust audio + simulation teardown. Call this whenever the user leaves
+  // the tour page (back button, unmount, etc.) to guarantee no audio leaks.
+  const cleanupAudio = useCallback(async () => {
+    // Invalidate any in-flight playSound callbacks so stale ones can't restart
+    audioGenRef.current++;
+
+    // Stop the simulation tick (prevents simTick from triggering more POI audio)
+    if (simIntervalRef.current) {
+      clearInterval(simIntervalRef.current);
+      simIntervalRef.current = null;
+    }
+
+    // Clear the queue and reset flags
+    poiQueueRef.current = [];
+    isPlayingPoiRef.current = false;
+    isPausedRef.current = false;
+
+    // Stop + unload both sounds. Stop before unload to kill audio immediately.
+    const narration = soundRef.current;
+    const music = bgMusicRef.current;
+    soundRef.current = null;
+    bgMusicRef.current = null;
+
+    await Promise.all([
+      (async () => {
+        if (!narration) return;
+        try { await narration.stopAsync(); } catch {}
+        try { await narration.unloadAsync(); } catch {}
+      })(),
+      (async () => {
+        if (!music) return;
+        try { await music.stopAsync(); } catch {}
+        try { await music.unloadAsync(); } catch {}
+      })(),
+    ]);
+  }, []);
 
   // ─── Audio setup ──────────────────────────────────────────
   useEffect(() => {
@@ -338,12 +400,17 @@ export default function TourScreen() {
       allowsRecordingIOS: false,
       staysActiveInBackground: true,
       playsInSilentModeIOS: true,
-    });
+      // DoNotMix + DuckOthers: take full audio focus from the Nav SDK
+      // (the home's NavigationView is still mounted in the tab stack and
+      // can hold the audio channel if we don't claim it here).
+      interruptionModeIOS: InterruptionModeIOS.DoNotMix,
+      interruptionModeAndroid: InterruptionModeAndroid.DuckOthers,
+      shouldDuckAndroid: true,
+    }).catch(() => {});
     return () => {
-      soundRef.current?.unloadAsync();
-      bgMusicRef.current?.unloadAsync();
+      cleanupAudio();
     };
-  }, []);
+  }, [cleanupAudio]);
 
   // Keep screen awake during simulation
   useEffect(() => {
@@ -465,27 +532,23 @@ export default function TourScreen() {
     const lookAhead = positionAtDistance(path, dt, simDistanceRef.current + 20);
     const hdg = bearing(pos, lookAhead);
 
-    // Move the chevron marker
-    try {
-      controller.addMarker({
-        id: "sim-chevron",
-        position: pos,
-        rotation: hdg,
-        flat: true,
-        title: "",
-        imgPath: getMarkerPaths().userArrow,
-      });
-    } catch {}
+    // Move the chevron marker — wrap promise with .catch since we don't await
+    Promise.resolve(controller.addMarker({
+      id: "sim-chevron",
+      position: pos,
+      rotation: hdg,
+      flat: true,
+      title: "",
+      imgPath: getMarkerPaths().userArrow,
+    }) as any).catch(() => undefined);
 
-    // Camera follow
-    try {
-      controller.moveCamera({
-        target: pos,
-        zoom: 18,
-        tilt: 45,
-        bearing: hdg,
-      });
-    } catch {}
+    // Camera follow — same treatment
+    Promise.resolve(controller.moveCamera({
+      target: pos,
+      zoom: 18,
+      tilt: 45,
+      bearing: hdg,
+    }) as any).catch(() => undefined);
 
     // Check POI proximity
     for (const { poi } of poiDistancesRef.current) {
@@ -559,7 +622,7 @@ export default function TourScreen() {
     // Remove chevron marker + re-fit map to route overview
     // Skip map operations if the page is unmounting (navigating away)
     if (!mapControllerRef.current) return;
-    try { mapControllerRef.current.clearMapView(); } catch {}
+    Promise.resolve(mapControllerRef.current.clearMapView() as any).catch(() => undefined);
 
     // Redraw route after a tick (clearMapView is async-ish)
     setTimeout(() => {
@@ -603,7 +666,7 @@ export default function TourScreen() {
 
         const lats = decodedPath.map((p) => p.lat);
         const lngs = decodedPath.map((p) => p.lng);
-        controller.moveCamera({
+        await Promise.resolve(controller.moveCamera({
           target: {
             lat: (Math.min(...lats) + Math.max(...lats)) / 2,
             lng: (Math.min(...lngs) + Math.max(...lngs)) / 2,
@@ -611,7 +674,7 @@ export default function TourScreen() {
           zoom: 12,
           tilt: 0,
           bearing: 0,
-        });
+        }) as any).catch(() => undefined);
       })();
     }, 300);
   }, [decodedPath, pois, route, stopTour]);
@@ -622,12 +685,16 @@ export default function TourScreen() {
     // Register with ActiveTourContext
     startTour(route.id, "simulating");
 
-    // Configure audio
+    // Re-claim audio focus right before playback (Nav SDK may have
+    // reclaimed it while user was on the home tab).
     await Audio.setAudioModeAsync({
       allowsRecordingIOS: false,
       staysActiveInBackground: true,
       playsInSilentModeIOS: true,
-    });
+      interruptionModeIOS: InterruptionModeIOS.DoNotMix,
+      interruptionModeAndroid: InterruptionModeAndroid.DuckOthers,
+      shouldDuckAndroid: true,
+    }).catch(() => {});
 
     // Calculate speed: total distance / estimated audio duration
     const visible = pois.filter((p) => !p.is_neighborhood_intro);
@@ -804,12 +871,13 @@ export default function TourScreen() {
       {/* Back button — floating on the map */}
       <TouchableOpacity
         style={[styles.mapBackButton, { top: insets.top + 12 }]}
-        onPress={() => {
-          if (simIntervalRef.current) clearInterval(simIntervalRef.current);
-          soundRef.current?.unloadAsync().catch(() => {});
-          bgMusicRef.current?.unloadAsync().catch(() => {});
+        onPress={async () => {
+          // Stop everything BEFORE navigating so audio doesn't linger.
+          await cleanupAudio();
           stopTour();
-          router.back();
+          // Return to wherever the user came from: home (Begin Sim Tour from
+          // proximity alert) or /routes (Sim Tour button on My Routes — default).
+          router.replace(from === "home" ? "/(tabs)" : "/(tabs)/routes");
         }}
       >
         <Text style={styles.mapBackText}>‹</Text>

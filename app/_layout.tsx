@@ -23,14 +23,6 @@ function ThemedRoot() {
       >
         <Stack.Screen name="(auth)" options={{ headerShown: false }} />
         <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
-        <Stack.Screen
-          name="tour/[id]"
-          options={{
-            headerShown: false,
-            presentation: "fullScreenModal",
-            gestureEnabled: false,
-          }}
-        />
       </Stack>
     </NavigationProvider>
   );

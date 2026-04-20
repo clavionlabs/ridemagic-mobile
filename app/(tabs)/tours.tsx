@@ -8,9 +8,9 @@ export default function ToursScreen() {
 
   return (
     <SafeAreaView style={[styles.container, { backgroundColor: theme.background }]}>
-      <Text style={[styles.title, { color: theme.text }]}>Tours</Text>
+      <Text style={[styles.title, { color: theme.text }]}>Explore</Text>
       <Text style={[styles.subtitle, { color: theme.textSecondary }]}>
-        Your audio tours will appear here
+        Discover curated tours near you
       </Text>
     </SafeAreaView>
   );

@@ -246,7 +246,7 @@ export default function HomeScreen() {
     setActiveField(null);
     if (routeData) {
       setRouteData(null); setPois([]); setTourReady(false); setRouteId(null);
-      try { mapControllerRef.current?.clearMapView(); } catch {}
+      if (mapControllerRef.current) Promise.resolve(mapControllerRef.current.clearMapView() as any).catch(() => undefined);
     }
   }, [routeData]);
 
@@ -312,6 +312,21 @@ export default function HomeScreen() {
     setMapReady(true);
   }, []);
 
+  // Compute map padding so native UI (compass, my-location, etc.) respects:
+  //  - top safe area (avoid system clock)
+  //  - POI panel bottom (when driving + panel expanded)
+  // Applied via the `mapPadding` prop on NavigationView below.
+  const mapPadding = {
+    top: insets.top + 8,
+    left: 0,
+    right: 0,
+    bottom: isDriving
+      ? currentDrivingPoi
+        ? poiPanelExpanded ? 230 : 60
+        : poiPanelExpanded ? 100 : 60
+      : 0,
+  };
+
   // Get user's current location and move camera to it once the map is ready
   useEffect(() => {
     if (!mapReady) return;
@@ -323,16 +338,14 @@ export default function HomeScreen() {
       setUserLoc(coords);
       // Small delay to ensure native MapView is fully attached before moveCamera
       setTimeout(() => {
-        try {
-          mapControllerRef.current?.moveCamera({
-            target: coords,
-            zoom: 14,
-            tilt: 0,
-            bearing: 0,
-          });
-        } catch (e) {
-          console.warn("Initial moveCamera failed:", e);
-        }
+        const c = mapControllerRef.current;
+        if (!c) return;
+        Promise.resolve(c.moveCamera({
+          target: coords,
+          zoom: 14,
+          tilt: 0,
+          bearing: 0,
+        }) as any).catch(() => undefined);
       }, 1000);
     })();
   }, [mapReady]);
@@ -366,7 +379,7 @@ export default function HomeScreen() {
     }));
 
     // Clear anything previously drawn so repeat draws don't stack
-    try { controller.clearMapView(); } catch {}
+    Promise.resolve(controller.clearMapView() as any).catch(() => undefined);
 
     // Draw gradient polyline in segments (Google Nav SDK = one color per polyline)
     if (!hidePolyline) {
@@ -442,19 +455,15 @@ export default function HomeScreen() {
         : maxSpan < 0.6 ? 10
         : 9;
 
-      try {
-        controller.moveCamera({
-          target: {
-            lat: (Math.min(...lats) + Math.max(...lats)) / 2,
-            lng: (Math.min(...lngs) + Math.max(...lngs)) / 2,
-          },
-          zoom,
-          bearing,
-          tilt: 0,
-        });
-      } catch (e) {
-        console.warn("Camera fit failed:", e);
-      }
+      Promise.resolve(controller.moveCamera({
+        target: {
+          lat: (Math.min(...lats) + Math.max(...lats)) / 2,
+          lng: (Math.min(...lngs) + Math.max(...lngs)) / 2,
+        },
+        zoom,
+        bearing,
+        tilt: 0,
+      }) as any).catch(() => undefined);
     }
   }, [routeData, pois]);
 
@@ -761,11 +770,61 @@ export default function HomeScreen() {
         setLoadingTour(false);
         return;
       }
+    }
+
+    if (!currentRouteId) return;
+
+    setLoadingTour(true);
+    setTourLoadingLabel("Preparing Audio...");
+    try {
+      // Wait for tour generation to be fully "ready" on Railway — even if
+      // routeId already exists, the backend might still be generating audio
+      // (welcome, POI narrations, music, closing) for a tour that was just
+      // started via Live Tour. Without this wait, the tour page loads with
+      // null audio_url values and play does nothing.
+      const waitForReady = async () => {
+        const maxAttempts = 30; // ~90s max
+        for (let i = 0; i < maxAttempts; i++) {
+          try {
+            const st = await api.getTourStatus(currentRouteId!);
+            if (st.status === "ready") return true;
+            if (st.status === "failed") throw new Error("Tour generation failed");
+          } catch (e: any) {
+            if (e?.message === "Tour generation failed") throw e;
+          }
+          await new Promise((r) => setTimeout(r, 3000));
+        }
+        return false;
+      };
+      const ready = await waitForReady();
+      if (!ready) {
+        console.warn("[SimTour] Tour not ready after 90s");
+      }
+
+      // Verify POI audio URLs are actually populated (belt-and-suspenders)
+      const { data: poiCheck } = await supabase
+        .from("route_pois")
+        .select("audio_url")
+        .eq("route_id", currentRouteId!);
+      const audioCount = (poiCheck || []).filter((p: any) => p.audio_url).length;
+      console.log(`[SimTour] ${audioCount}/${poiCheck?.length || 0} POIs have audio`);
+
+      // Pre-claim audio focus
+      await Audio.setAudioModeAsync({
+        allowsRecordingIOS: false,
+        staysActiveInBackground: true,
+        playsInSilentModeIOS: true,
+      }).catch(() => {});
+    } catch (e: any) {
+      Alert.alert("Error", e?.message || "Failed to prepare tour");
+      setLoadingTour(false);
+      return;
+    } finally {
       setLoadingTour(false);
     }
-    if (currentRouteId) {
-      router.push(`/tour/${currentRouteId}`);
-    }
+
+    // Pass from=home so the tour page's back button returns here instead of My Routes
+    router.push({ pathname: "/tour/[id]", params: { id: currentRouteId, from: "home" } });
   }, [routeId, routeData, origin, destination, pois, router]);
 
   const PROXIMITY_RADIUS_M = 5;
@@ -1004,16 +1063,12 @@ export default function HomeScreen() {
       if (routeData?.decodedPath?.length > 1) {
         drawRouteOnMap().catch((e) => console.warn("Exit-drive draw failed:", e));
       } else if (userLoc && mapControllerRef.current) {
-        try {
-          mapControllerRef.current.moveCamera({
-            target: userLoc,
-            zoom: 14,
-            tilt: 0,
-            bearing: 0,
-          });
-        } catch (e) {
-          console.warn("Exit-drive moveCamera failed:", e);
-        }
+        Promise.resolve(mapControllerRef.current.moveCamera({
+          target: userLoc,
+          zoom: 14,
+          tilt: 0,
+          bearing: 0,
+        }) as any).catch(() => undefined);
       }
     }, 500);
   }, [routeData, userLoc, drawRouteOnMap]);
@@ -1071,6 +1126,7 @@ export default function HomeScreen() {
           setNavViewReady(true);
         }}
         mapId="da9e1e4ff9cfa0ff3017deab"
+        mapPadding={mapPadding}
         headerEnabled={false}
         footerEnabled={false}
         speedometerEnabled={false}
@@ -1091,10 +1147,18 @@ export default function HomeScreen() {
         </View>
       )}
 
-      {/* Custom recenter button */}
+      {/* Custom recenter button — floats above POI panel, synced with expand state */}
       {isDriving && (
         <TouchableOpacity
-          style={styles.recenterButton}
+          style={[
+            styles.recenterButton,
+            {
+              bottom:
+                (currentDrivingPoi
+                  ? poiPanelExpanded ? 240 : 64
+                  : poiPanelExpanded ? 100 : 64) + insets.bottom,
+            },
+          ]}
           onPress={() => {
             if (navViewControllerRef.current) {
               navViewControllerRef.current.setFollowingPerspective(CameraPerspective.TILTED);
@@ -1210,7 +1274,7 @@ export default function HomeScreen() {
                       if (origin !== "Current Location") setOrigin("");
                       if (routeData) {
                         setRouteData(null); setPois([]); setTourReady(false); setRouteId(null);
-                        try { mapControllerRef.current?.clearMapView(); } catch {}
+                        if (mapControllerRef.current) Promise.resolve(mapControllerRef.current.clearMapView() as any).catch(() => undefined);
                       }
                       fetchSuggestions(text, "origin");
                     }}
@@ -1239,7 +1303,7 @@ export default function HomeScreen() {
                     if (destination) setDestination("");
                     if (routeData) {
                       setRouteData(null); setPois([]); setTourReady(false); setRouteId(null);
-                      try { mapControllerRef.current?.clearMapView(); } catch {}
+                      if (mapControllerRef.current) Promise.resolve(mapControllerRef.current.clearMapView() as any).catch(() => undefined);
                     }
                     fetchSuggestions(text, "dest");
                   }}
@@ -1520,7 +1584,6 @@ const styles = StyleSheet.create({
   recenterButton: {
     position: "absolute",
     right: 16,
-    bottom: 240,
     borderRadius: 20,
     paddingHorizontal: 14,
     paddingVertical: 10,

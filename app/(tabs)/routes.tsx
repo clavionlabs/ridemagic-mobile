@@ -189,7 +189,7 @@ export default function RoutesScreen() {
       >
         <Text style={{ fontSize: 28 }}>🗺</Text>
       </View>
-      <Text style={[styles.emptyTitle, { color: theme.text }]}>No routes yet</Text>
+      <Text style={[styles.emptyTitle, { color: theme.text }]}>No tours yet</Text>
       <Text style={[styles.emptySubtitle, { color: theme.textSecondary }]}>
         Plan your first ride from the dashboard
       </Text>
@@ -204,7 +204,7 @@ export default function RoutesScreen() {
 
   return (
     <SafeAreaView style={[styles.container, { backgroundColor: theme.background }]}>
-      <Text style={[styles.title, { color: theme.text }]}>My Routes</Text>
+      <Text style={[styles.title, { color: theme.text }]}>My Tours</Text>
 
       {loading ? (
         <View style={styles.loadingContainer}>
