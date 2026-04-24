@@ -94,6 +94,9 @@ export default function HomeScreen() {
 
   const soundRef = useRef<Audio.Sound | null>(null);
   const bgMusicRef = useRef<Audio.Sound | null>(null);
+  // Pre-loaded POI audio, keyed by POI id. Populated in handleStartTour during
+  // the "Preparing Audio..." phase so playback is instant when geofence fires.
+  const poiSoundsRef = useRef<Record<string, Audio.Sound>>({});
   const triggeredPoisRef = useRef<Set<string>>(new Set());
   const [tourPois, setTourPois] = useState<any[]>([]);
   const [tourLoadingLabel, setTourLoadingLabel] = useState("Generating Tour...");
@@ -495,23 +498,38 @@ export default function HomeScreen() {
       try {
         try { await bgMusicRef.current?.setVolumeAsync(0.08); } catch {}
 
+        // Stop but DON'T unload the previous sound if it's a pre-loaded POI
+        // sound — we want to keep it cached for potential replay. Only unload
+        // dynamically-created sounds.
         if (soundRef.current) {
-          try {
-            await soundRef.current.stopAsync();
-            await soundRef.current.unloadAsync();
-          } catch {}
+          try { await soundRef.current.stopAsync(); } catch {}
           soundRef.current = null;
         }
 
         if (gen !== audioGen) return;
 
-        const { sound } = await Audio.Sound.createAsync(
-          { uri: poi.audio_url },
-          { shouldPlay: true }
-        );
+        // Use pre-loaded sound if available, otherwise create on-demand.
+        let sound = poiSoundsRef.current[poi.id];
+        if (sound) {
+          try {
+            await sound.setPositionAsync(0);
+            await sound.playAsync();
+          } catch {
+            // Pre-loaded sound is stale — fall back to createAsync
+            sound = undefined as any;
+          }
+        }
+        if (!sound) {
+          const created = await Audio.Sound.createAsync(
+            { uri: poi.audio_url },
+            { shouldPlay: true }
+          );
+          sound = created.sound;
+          poiSoundsRef.current[poi.id] = sound;
+        }
 
         if (gen !== audioGen) {
-          sound.unloadAsync().catch(() => {});
+          try { await sound.stopAsync(); } catch {}
           return;
         }
 
@@ -827,51 +845,25 @@ export default function HomeScreen() {
     router.push({ pathname: "/tour/[id]", params: { id: currentRouteId, from: "home" } });
   }, [routeId, routeData, origin, destination, pois, router]);
 
-  const PROXIMITY_RADIUS_M = 5;
-
   const handleStartTour = async () => {
     if (!routeData) return;
 
-    // Proximity check — user must be within 5m of the starting point for live driving.
-    // Skip if origin is "Current Location" — user is already there by definition.
+    // Case A — origin isn't "Current Location": live driving isn't appropriate.
+    // Show the Sim Tour popup and route the user straight to the simulator.
+    // No Nav SDK, no proximity check, no GPS streaming.
     if (origin !== "Current Location") {
-    try {
-      const { status } = await Location.requestForegroundPermissionsAsync();
-      if (status === "granted") {
-        setLoadingTour(true);
-        setTourLoadingLabel("Checking location...");
-        const loc = await Location.getCurrentPositionAsync({});
-        const distToOrigin = (() => {
-          const R = 6371000;
-          const dLat = ((routeData.originLat - loc.coords.latitude) * Math.PI) / 180;
-          const dLng = ((routeData.originLng - loc.coords.longitude) * Math.PI) / 180;
-          const a = Math.sin(dLat / 2) ** 2 +
-            Math.cos((loc.coords.latitude * Math.PI) / 180) * Math.cos((routeData.originLat * Math.PI) / 180) * Math.sin(dLng / 2) ** 2;
-          return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-        })();
-
-        if (distToOrigin > PROXIMITY_RADIUS_M) {
-          setLoadingTour(false);
-          Alert.alert(
-            "Too Far from Starting Point",
-            `You must be within ${PROXIMITY_RADIUS_M} meters of the starting point to begin a live tour. You are currently ${Math.round(distToOrigin)}m away.`,
-            [
-              { text: "Cancel", style: "cancel" },
-              {
-                text: "Begin Sim Tour",
-                onPress: () => handleSimTour(),
-              },
-            ]
-          );
-          return;
-        }
-      }
-    } catch (e) {
-      console.warn("Proximity check failed:", e);
-      // If location check fails, let them proceed anyway
+      Alert.alert(
+        "Sim Tour Only",
+        "Your starting point isn't your current location. You can still experience this tour as a simulation.",
+        [
+          { text: "Cancel", style: "cancel" },
+          { text: "Begin Sim Tour", onPress: () => handleSimTour() },
+        ]
+      );
+      return;
     }
-    } // end origin !== "Current Location" check
 
+    // Case B — origin is "Current Location": proceed with live driving mode.
     try {
       // If tour was already generated (e.g. re-entering after exit driving),
       // skip straight to pre-loading audio — no need to regenerate.
@@ -948,6 +940,28 @@ export default function HomeScreen() {
           welcomeSound = sound;
         } catch {}
       }
+
+      // Pre-load POI audio in the background — non-blocking so welcome can
+      // start playing immediately. Each POI's Sound is cached by id; playPoiAudio
+      // picks it up instantly if ready, or falls back to on-demand createAsync.
+      // Unload any old pre-loaded sounds from a previous session first.
+      for (const s of Object.values(poiSoundsRef.current)) {
+        s.unloadAsync().catch(() => {});
+      }
+      poiSoundsRef.current = {};
+      (async () => {
+        for (const poi of poiRows) {
+          if (!poi.audio_url) continue;
+          try {
+            const { sound } = await Audio.Sound.createAsync(
+              { uri: poi.audio_url },
+              { shouldPlay: false, volume: 1.0 }
+            );
+            poiSoundsRef.current[poi.id] = sound;
+          } catch {}
+        }
+        console.log(`[Tour] Pre-loaded ${Object.keys(poiSoundsRef.current).length}/${poiRows.length} POI audio files`);
+      })();
 
       // Pre-load music
       let musicSound: Audio.Sound | null = null;
@@ -1047,10 +1061,16 @@ export default function HomeScreen() {
     isPlayingPoiRef.current = false;
 
     if (soundRef.current) {
-      await soundRef.current.stopAsync();
-      await soundRef.current.unloadAsync();
+      try { await soundRef.current.stopAsync(); } catch {}
+      // Don't unload here — soundRef may point to a pre-loaded POI sound
+      // that's tracked in poiSoundsRef. We unload those below.
       soundRef.current = null;
     }
+    // Unload all pre-loaded POI sounds
+    for (const s of Object.values(poiSoundsRef.current)) {
+      try { await s.unloadAsync(); } catch {}
+    }
+    poiSoundsRef.current = {};
     if (bgMusicRef.current) {
       await bgMusicRef.current.stopAsync();
       await bgMusicRef.current.unloadAsync();

@@ -209,6 +209,10 @@ export default function TourScreen() {
   const poiDistancesRef = useRef<{ poi: POI; distM: number }[]>([]);
   const triggeredRef = useRef<Set<string>>(new Set());
   const poiQueueRef = useRef<POI[]>([]);
+  // POIs that were proximity-triggered but had no audio_url yet.
+  // The polling effect drains this ref as audio URLs arrive, kicking
+  // ready POIs into playPoiAudio or the main queue.
+  const pendingAudioRef = useRef<Set<string>>(new Set());
   const isPlayingPoiRef = useRef(false);
   const isPausedRef = useRef(false);
   const totalRouteDistRef = useRef(0);
@@ -250,22 +254,106 @@ export default function TourScreen() {
         totalRouteDistRef.current = dt[dt.length - 1] || 0;
       }
       if (poiData) {
-        const sorted = (poiData as POI[]).filter((p) => !p.is_neighborhood_intro);
         setPois(poiData as POI[]);
-
-        // Pre-compute each visible POI's distance along the polyline
-        if (routeData) {
-          const path = decodePolyline(routeData.polyline);
-          const dt = buildDistanceTable(path);
-          poiDistancesRef.current = sorted.map((poi) => ({
-            poi,
-            distM: findClosestPolylineIndex({ lat: poi.lat, lng: poi.lng }, dt, path),
-          }));
-        }
       }
       setLoading(false);
     })();
   }, [user, id]);
+
+  // Sync poiDistancesRef whenever `pois` state changes. The polling effect
+  // below updates POIs with newly-populated audio_url values — without this
+  // sync, simTick would keep reading the ORIGINAL POI objects (where
+  // audio_url was null) and skip playback forever.
+  useEffect(() => {
+    if (!route || !pois.length || decodedPath.length < 2) return;
+    const sorted = pois.filter((p) => !p.is_neighborhood_intro);
+    const dt = buildDistanceTable(decodedPath);
+    poiDistancesRef.current = sorted.map((poi) => ({
+      poi,
+      distM: findClosestPolylineIndex({ lat: poi.lat, lng: poi.lng }, dt, decodedPath),
+    }));
+  }, [pois, route, decodedPath]);
+
+  // Poll for missing POI audio URLs. Phase B in the backend generates POI
+  // narrations in parallel after Phase A marks status=ready, so audio_url
+  // fields populate progressively. We re-fetch every 3s and merge in any
+  // newly-populated URLs, stopping once all POIs have audio or after 2min.
+  useEffect(() => {
+    if (!id || pois.length === 0) return;
+    // If every POI already has audio, nothing to poll
+    if (pois.every((p) => p.audio_url)) return;
+
+    let cancelled = false;
+    const maxAttempts = 40; // 40 × 3s = 120s max
+    let attempt = 0;
+
+    const tick = async () => {
+      if (cancelled) return;
+      attempt++;
+
+      const { data } = await supabase
+        .from("route_pois")
+        .select("id, audio_url, audio_duration_sec")
+        .eq("route_id", id);
+
+      if (!data || cancelled) return;
+
+      const audioById = new Map<string, { audio_url: string | null; audio_duration_sec: number | null }>();
+      for (const row of data) audioById.set(row.id, { audio_url: row.audio_url, audio_duration_sec: row.audio_duration_sec });
+
+      // Track POIs whose audio just became ready this tick — we need to
+      // flush any of them that are in pendingAudioRef into playback.
+      const newlyReady: POI[] = [];
+
+      setPois((prev) => {
+        let changed = false;
+        const next = prev.map((p) => {
+          const fresh = audioById.get(p.id);
+          if (fresh?.audio_url && !p.audio_url) {
+            changed = true;
+            const updated = { ...p, audio_url: fresh.audio_url, audio_duration_sec: fresh.audio_duration_sec ?? p.audio_duration_sec };
+            if (pendingAudioRef.current.has(p.id)) newlyReady.push(updated);
+            return updated;
+          }
+          return p;
+        });
+        return changed ? next : prev;
+      });
+
+      // Drain pending POIs whose audio just arrived
+      for (const poi of newlyReady) {
+        pendingAudioRef.current.delete(poi.id);
+        console.log(`[Sim] ▶ Pending "${poi.name}" audio ready — dispatching`);
+        if (isPlayingPoiRef.current) {
+          poiQueueRef.current.push(poi);
+        } else {
+          playPoiAudio(poi);
+        }
+      }
+
+      const allReady = Array.from(audioById.values()).every((v) => v.audio_url);
+      if (allReady) {
+        console.log(`[Tour] All POI audio ready after ${attempt} polls`);
+        return;
+      }
+      if (attempt >= maxAttempts) {
+        console.warn(`[Tour] Stopped polling after ${attempt} attempts — some POIs may still be generating`);
+        return;
+      }
+
+      setTimeout(tick, 3000);
+    };
+
+    setTimeout(tick, 3000);
+    return () => { cancelled = true; };
+  }, [id, pois.length]);
+
+  // Track whether we've successfully drawn once, so we only clearMapView on
+  // subsequent re-runs (when data actually changes). Calling clearMapView on
+  // first mount crashes with NullPointerException because the fragment's
+  // internal MapViewController isn't fully initialized yet — only the outer
+  // controller ref is valid.
+  const hasDrawnRef = useRef(false);
 
   // ─── Draw route on map ────────────────────────────────────
   useEffect(() => {
@@ -284,8 +372,12 @@ export default function TourScreen() {
 
     const timer = setTimeout(async () => {
       if (cancelled) return;
-      // Clear any previous polylines/markers before drawing
-      await safe(controller.clearMapView() as any);
+      // Only clear on re-runs — first draw is on a fresh map, no need to clear.
+      // Clearing on first mount can crash the native code if the fragment's
+      // map controller isn't yet initialized.
+      if (hasDrawnRef.current) {
+        await safe(controller.clearMapView() as any);
+      }
       if (cancelled) return;
 
       // Gradient polyline
@@ -343,17 +435,17 @@ export default function TourScreen() {
         tilt: 0,
         bearing: 0,
       }));
+
+      // Mark first draw as complete — subsequent effect re-runs will now clear
+      // the map before drawing (safe once internal native controller is up).
+      hasDrawnRef.current = true;
     }, 1000);
 
     return () => {
       cancelled = true;
       clearTimeout(timer);
-      // Clear on unmount. Use the same safe wrapper so a reject during teardown
-      // (common when the native map view is being torn down) doesn't leak.
-      const c = mapControllerRef.current;
-      if (c) {
-        Promise.resolve(c.clearMapView() as any).catch(() => undefined);
-      }
+      // Don't call clearMapView on unmount — the native MapViewController can
+      // already be null during teardown, and the native NPE kills the app.
     };
   }, [decodedPath, pois, route, mapReady]);
 
@@ -371,6 +463,7 @@ export default function TourScreen() {
 
     // Clear the queue and reset flags
     poiQueueRef.current = [];
+    pendingAudioRef.current = new Set();
     isPlayingPoiRef.current = false;
     isPausedRef.current = false;
 
@@ -553,7 +646,6 @@ export default function TourScreen() {
     // Check POI proximity
     for (const { poi } of poiDistancesRef.current) {
       if (triggeredRef.current.has(poi.id)) continue;
-      if (!poi.audio_url) continue;
       const poiPos = { lat: poi.lat, lng: poi.lng };
       const dist = haversineM(pos.lat, pos.lng, poiPos.lat, poiPos.lng);
       if (dist <= TRIGGER_RADIUS_M) {
@@ -561,7 +653,12 @@ export default function TourScreen() {
         // update the UI chips yet — that happens when the audio actually
         // starts playing inside playPoiAudio, not when it's detected/queued.
         triggeredRef.current.add(poi.id);
-        if (isPlayingPoiRef.current) {
+        if (!poi.audio_url) {
+          // Audio not ready yet — defer. Polling effect will kick this
+          // POI into playback as soon as its audio_url populates.
+          pendingAudioRef.current.add(poi.id);
+          console.log(`[Sim] ⏳ PENDING audio for "${poi.name}" — will play when ready`);
+        } else if (isPlayingPoiRef.current) {
           poiQueueRef.current.push(poi);
         } else {
           playPoiAudio(poi);
@@ -620,8 +717,10 @@ export default function TourScreen() {
     stopTour();
 
     // Remove chevron marker + re-fit map to route overview
-    // Skip map operations if the page is unmounting (navigating away)
-    if (!mapControllerRef.current) return;
+    // Skip map operations if the page is unmounting (navigating away) or if
+    // the initial draw hasn't completed yet (internal native controller may
+    // still be null and would crash with NullPointerException).
+    if (!mapControllerRef.current || !hasDrawnRef.current) return;
     Promise.resolve(mapControllerRef.current.clearMapView() as any).catch(() => undefined);
 
     // Redraw route after a tick (clearMapView is async-ish)
