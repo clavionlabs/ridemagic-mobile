@@ -6,6 +6,9 @@ import {
   TouchableOpacity,
   ScrollView,
   ActivityIndicator,
+  Image,
+  Modal,
+  Pressable,
 } from "react-native";
 import { MapView } from "@googlemaps/react-native-navigation-sdk";
 import type { MapViewController } from "@googlemaps/react-native-navigation-sdk";
@@ -154,6 +157,7 @@ interface POI {
   audio_url: string | null;
   audio_duration_sec: number | null;
   is_neighborhood_intro: boolean;
+  place_id?: string | null;
 }
 
 type SimState = "idle" | "welcome" | "navigating" | "narrating" | "closing" | "completed";
@@ -198,6 +202,18 @@ export default function TourScreen() {
   const [duration, setDuration] = useState(0);
   const [triggeredPois, setTriggeredPois] = useState<Set<string>>(new Set());
 
+  // POI photo for the now-playing section. Cached by place_id so revisiting
+  // a POI doesn't re-fetch.
+  const [poiPhotoUrl, setPoiPhotoUrl] = useState<string | null>(null);
+  const poiPhotoCache = useRef<Record<string, string>>({});
+  // Lightbox / fullscreen image preview state
+  const [photoEnlarged, setPhotoEnlarged] = useState(false);
+
+  // The POI currently being narrated, derived from currentSegmentIndex
+  const currentPoi: POI | null = currentSegmentIndex >= 0 && pois[currentSegmentIndex]
+    ? pois[currentSegmentIndex]
+    : null;
+
   // ─── Audio refs ───────────────────────────────────────────
   const soundRef = useRef<Audio.Sound | null>(null);
   const bgMusicRef = useRef<Audio.Sound | null>(null);
@@ -222,6 +238,43 @@ export default function TourScreen() {
   // roughly when all audio has played.
   const simSpeedRef = useRef(0);
 
+  // Fetch a Google Places photo for the currently-narrating POI. Falls back
+  // to a static map image if the POI has no photo on file. Cached by place_id.
+  useEffect(() => {
+    const placeId = currentPoi?.place_id;
+    if (!placeId || !currentPoi) {
+      setPoiPhotoUrl(null);
+      return;
+    }
+    if (poiPhotoCache.current[placeId]) {
+      setPoiPhotoUrl(poiPhotoCache.current[placeId]);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch(
+          `https://maps.googleapis.com/maps/api/place/details/json?place_id=${placeId}&fields=photos&key=${ENV.GOOGLE_MAPS_API_KEY}`
+        );
+        const data = await res.json();
+        const photoRef = data?.result?.photos?.[0]?.photo_reference;
+        if (cancelled) return;
+        if (photoRef) {
+          const url = `https://maps.googleapis.com/maps/api/place/photo?maxwidth=600&photo_reference=${photoRef}&key=${ENV.GOOGLE_MAPS_API_KEY}`;
+          poiPhotoCache.current[placeId] = url;
+          setPoiPhotoUrl(url);
+        } else {
+          const fallback = `https://maps.googleapis.com/maps/api/staticmap?center=${currentPoi.lat},${currentPoi.lng}&zoom=17&size=600x200&maptype=roadmap&markers=color:0x7C5CFC|${currentPoi.lat},${currentPoi.lng}&key=${ENV.GOOGLE_MAPS_API_KEY}`;
+          poiPhotoCache.current[placeId] = fallback;
+          setPoiPhotoUrl(fallback);
+        }
+      } catch {
+        if (!cancelled) setPoiPhotoUrl(null);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [currentPoi]);
+
   const onMapViewControllerCreated = useCallback((controller: MapViewController) => {
     mapControllerRef.current = controller;
     setMapReady(true);
@@ -230,6 +283,7 @@ export default function TourScreen() {
   // ─── Fetch data ───────────────────────────────────────────
   useEffect(() => {
     if (!user || !id) return;
+    console.log(`[Tour ${id}] Tour page MOUNTED — initial state: simState=${simState}, isPlaying=${isPlaying}, isPlayingPoi=${isPlayingPoiRef.current}`);
     (async () => {
       const { data: routeData } = await supabase
         .from("routes")
@@ -239,9 +293,11 @@ export default function TourScreen() {
 
       const { data: poiData } = await supabase
         .from("route_pois")
-        .select("id, name, lat, lng, sequence_order, audio_url, audio_duration_sec, is_neighborhood_intro")
+        .select("id, name, lat, lng, sequence_order, audio_url, audio_duration_sec, is_neighborhood_intro, place_id")
         .eq("route_id", id)
         .order("sequence_order", { ascending: true });
+
+      console.log(`[Tour ${id}] Fetched: route=${!!routeData}, total POIs=${poiData?.length ?? 0}, visible POIs=${(poiData ?? []).filter((p: any) => !p.is_neighborhood_intro).length}`);
 
       if (routeData) {
         setRoute(routeData);
@@ -451,7 +507,10 @@ export default function TourScreen() {
 
   // Robust audio + simulation teardown. Call this whenever the user leaves
   // the tour page (back button, unmount, etc.) to guarantee no audio leaks.
+  // Resets BOTH the audio system and the UI state so coming back to the
+  // same tour id starts fresh (expo-router reuses this component).
   const cleanupAudio = useCallback(async () => {
+    console.log("[Tour] cleanupAudio() — stopping audio + simulation + resetting state");
     // Invalidate any in-flight playSound callbacks so stale ones can't restart
     audioGenRef.current++;
 
@@ -461,11 +520,30 @@ export default function TourScreen() {
       simIntervalRef.current = null;
     }
 
-    // Clear the queue and reset flags
+    // Clear queues + reset all sim refs
     poiQueueRef.current = [];
     pendingAudioRef.current = new Set();
     isPlayingPoiRef.current = false;
     isPausedRef.current = false;
+    triggeredRef.current = new Set();
+    simDistanceRef.current = 0;
+    simSpeedRef.current = 0;
+
+    // Reset UI state so the play button works again next time
+    setSimState("idle");
+    setIsPlaying(false);
+    setCurrentTime(0);
+    setDuration(0);
+    setCurrentSegmentIndex(-1);
+    setTriggeredPois(new Set());
+
+    // Remove the simulated car marker so it doesn't sit at its last position
+    // when the user comes back to the same tour. Wrap with .catch since the
+    // SDK's removeMarker returns a promise that rejects if the map view
+    // isn't fully initialized — try/catch can't catch async rejections.
+    if (mapControllerRef.current) {
+      Promise.resolve(mapControllerRef.current.removeMarker("sim-chevron") as any).catch(() => undefined);
+    }
 
     // Stop + unload both sounds. Stop before unload to kill audio immediately.
     const narration = soundRef.current;
@@ -487,6 +565,38 @@ export default function TourScreen() {
     ]);
   }, []);
 
+  // Reset all sim/audio state whenever the tour id changes. Expo-router
+  // reuses this component with new params instead of unmounting+remounting,
+  // so state from a previous tour can leak in (audio kept playing, chips
+  // showing stale POIs, etc.). This effect kills everything for a fresh start.
+  const lastIdRef = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    if (!id || lastIdRef.current === id) return;
+    const prevId = lastIdRef.current;
+    lastIdRef.current = id;
+    if (!prevId) return; // first mount — initial state is already clean
+    console.log(`[Tour ${id}] id changed from ${prevId} — resetting all state`);
+    cleanupAudio();
+    setSimState("idle");
+    setIsPlaying(false);
+    setCurrentTime(0);
+    setDuration(0);
+    setCurrentSegmentIndex(-1);
+    setTriggeredPois(new Set());
+    setLoading(true);
+    setRoute(null);
+    setPois([]);
+    setDecodedPath([]);
+    hasDrawnRef.current = false;
+    triggeredRef.current = new Set();
+    pendingAudioRef.current = new Set();
+    poiQueueRef.current = [];
+    isPlayingPoiRef.current = false;
+    isPausedRef.current = false;
+    simDistanceRef.current = 0;
+    simSpeedRef.current = 0;
+  }, [id, cleanupAudio]);
+
   // ─── Audio setup ──────────────────────────────────────────
   useEffect(() => {
     Audio.setAudioModeAsync({
@@ -505,12 +615,14 @@ export default function TourScreen() {
     };
   }, [cleanupAudio]);
 
-  // Keep screen awake during simulation
+  // Keep screen awake during simulation. Wrap calls so rejections (e.g.,
+  // when the app is backgrounded or closing) don't crash as unhandled
+  // promise errors.
   useEffect(() => {
     if (simState !== "idle" && simState !== "completed") {
-      activateKeepAwakeAsync();
+      activateKeepAwakeAsync().catch(() => {});
     } else {
-      deactivateKeepAwake();
+      try { deactivateKeepAwake(); } catch {}
     }
   }, [simState]);
 
@@ -999,21 +1111,34 @@ export default function TourScreen() {
           {visiblePois.map((poi, idx) => {
             const isTriggered = triggeredPois.has(poi.id);
             const isNowPlaying = simState === "narrating" && currentSegmentIndex === pois.indexOf(poi);
+            // Audio not yet generated by the backend (Phase B still running)
+            const isAudioLoading = !poi.audio_url;
 
             let chipColor = colors.charcoal; // default: not yet reached
-            if (isNowPlaying) chipColor = colors.sunsetOrange; // currently narrating
+            if (isNowPlaying) chipColor = colors.mysticPurple; // currently narrating
             else if (isTriggered) chipColor = colors.magicGreen; // done
 
             return (
               <TouchableOpacity
                 key={poi.id}
-                onPress={() => { if (simState !== "idle") skipToPoiIndex(idx); }}
+                onPress={() => { if (simState !== "idle" && !isAudioLoading) skipToPoiIndex(idx); }}
+                disabled={isAudioLoading}
                 style={[styles.chip, {
                   backgroundColor: chipColor,
                   borderWidth: isNowPlaying ? 2 : 0,
                   borderColor: "#fff",
+                  opacity: isAudioLoading ? 0.6 : 1,
+                  flexDirection: "row",
+                  alignItems: "center",
                 }]}
               >
+                {isAudioLoading && (
+                  <ActivityIndicator
+                    size="small"
+                    color="#fff"
+                    style={{ marginRight: 6, transform: [{ scale: 0.7 }] }}
+                  />
+                )}
                 <Text style={styles.chipText}>
                   {isNowPlaying ? "▶ " : ""}{idx + 1}. {poi.name.substring(0, 20)}{poi.name.length > 20 ? "…" : ""}
                 </Text>
@@ -1030,9 +1155,19 @@ export default function TourScreen() {
 
         {/* Now playing info */}
         <View style={styles.nowPlaying}>
-          <View style={[styles.nowPlayingIcon, { backgroundColor: isDark ? colors.charcoal : "#f0f0f0" }]}>
-            <Text style={{ fontSize: 20 }}>✦</Text>
-          </View>
+          {simState === "narrating" && poiPhotoUrl ? (
+            <TouchableOpacity onPress={() => setPhotoEnlarged(true)} activeOpacity={0.8}>
+              <Image
+                source={{ uri: poiPhotoUrl }}
+                style={styles.nowPlayingImage}
+                resizeMode="cover"
+              />
+            </TouchableOpacity>
+          ) : (
+            <View style={[styles.nowPlayingIcon, { backgroundColor: isDark ? colors.charcoal : "#f0f0f0" }]}>
+              <Text style={{ fontSize: 20 }}>✦</Text>
+            </View>
+          )}
           <View style={styles.nowPlayingInfo}>
             <Text style={[styles.nowPlayingTitle, { color: theme.text }]} numberOfLines={1}>
               {currentLabel}
@@ -1094,6 +1229,30 @@ export default function TourScreen() {
           </TouchableOpacity>
         </View>
       </View>
+
+      {/* Lightbox — fullscreen POI image preview */}
+      <Modal
+        visible={photoEnlarged}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setPhotoEnlarged(false)}
+      >
+        <Pressable style={styles.lightboxBackdrop} onPress={() => setPhotoEnlarged(false)}>
+          {poiPhotoUrl && (
+            <Image
+              source={{ uri: poiPhotoUrl }}
+              style={styles.lightboxImage}
+              resizeMode="contain"
+            />
+          )}
+          <TouchableOpacity
+            style={[styles.lightboxClose, { top: insets.top + 12 }]}
+            onPress={() => setPhotoEnlarged(false)}
+          >
+            <Text style={styles.lightboxCloseText}>✕</Text>
+          </TouchableOpacity>
+        </Pressable>
+      </Modal>
     </View>
   );
 }
@@ -1164,6 +1323,38 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     alignItems: "center",
     marginRight: spacing.md,
+  },
+  nowPlayingImage: {
+    width: 48,
+    height: 48,
+    borderRadius: borderRadius.md,
+    marginRight: spacing.md,
+    backgroundColor: "#333",
+  },
+  lightboxBackdrop: {
+    flex: 1,
+    backgroundColor: "rgba(0,0,0,0.92)",
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  lightboxImage: {
+    width: "100%",
+    height: "80%",
+  },
+  lightboxClose: {
+    position: "absolute",
+    right: 16,
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: "rgba(255,255,255,0.15)",
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  lightboxCloseText: {
+    color: "#fff",
+    fontSize: 18,
+    fontWeight: "700",
   },
   nowPlayingInfo: { flex: 1 },
   nowPlayingTitle: { fontSize: fontSize.md, fontWeight: "700" },

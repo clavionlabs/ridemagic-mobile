@@ -748,6 +748,7 @@ export default function HomeScreen() {
     if (!currentRouteId && routeData) {
       setLoadingTour(true);
       setTourLoadingLabel("Generating Tour...");
+      console.log(`[SimTour] Saving route with ${pois.length} POIs (current state)`);
       try {
         const saved = await api.saveRoute({
           originAddress: origin,
@@ -1432,21 +1433,35 @@ export default function HomeScreen() {
                 </LinearGradient>
               </TouchableOpacity>
             ) : routeData ? (
-              <TouchableOpacity
-                style={[styles.button, { backgroundColor: colors.magicGreen }, (loadingTour && !tourReady) && styles.buttonDisabled]}
-                onPress={handleStartTour}
-                disabled={loadingTour && !tourReady}
-                activeOpacity={0.8}
-              >
-                {loadingTour && !tourReady ? (
-                  <View style={styles.loadingRow}>
-                    <ActivityIndicator color="#fff" size="small" />
-                    <Text style={[styles.buttonText, { marginLeft: 8 }]}>{tourLoadingLabel}</Text>
-                  </View>
-                ) : (
-                  <Text style={styles.buttonText}>Start Tour</Text>
-                )}
-              </TouchableOpacity>
+              (() => {
+                // Disable Start Tour while we're still fetching POIs from the
+                // backend. Once loadingRoute = false, we have a final answer:
+                // either pois.length > 0 (enable Start Tour) or 0 (route was
+                // too short for any POIs — still allow start, no audio).
+                const isBusy = loadingRoute || (loadingTour && !tourReady);
+                return (
+                  <TouchableOpacity
+                    style={[styles.button, { backgroundColor: colors.magicGreen }, isBusy && styles.buttonDisabled]}
+                    onPress={handleStartTour}
+                    disabled={isBusy}
+                    activeOpacity={0.8}
+                  >
+                    {loadingTour && !tourReady ? (
+                      <View style={styles.loadingRow}>
+                        <ActivityIndicator color="#fff" size="small" />
+                        <Text style={[styles.buttonText, { marginLeft: 8 }]}>{tourLoadingLabel}</Text>
+                      </View>
+                    ) : loadingRoute ? (
+                      <View style={styles.loadingRow}>
+                        <ActivityIndicator color="#fff" size="small" />
+                        <Text style={[styles.buttonText, { marginLeft: 8 }]}>Loading POIs...</Text>
+                      </View>
+                    ) : (
+                      <Text style={styles.buttonText}>Start Tour</Text>
+                    )}
+                  </TouchableOpacity>
+                );
+              })()
             ) : null
           )}
         </Animated.View>
