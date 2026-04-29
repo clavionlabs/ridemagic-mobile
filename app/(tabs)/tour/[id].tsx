@@ -232,11 +232,17 @@ export default function TourScreen() {
   const isPlayingPoiRef = useRef(false);
   const isPausedRef = useRef(false);
   const totalRouteDistRef = useRef(0);
+  // Mirror of simState so simTick (which runs in a setInterval closure)
+  // can always read the current state instead of a stale captured value.
+  const simStateRef = useRef<SimState>("idle");
 
   // Speed: meters per SIM_TICK_MS. We compute this from the total route distance
   // and the approximate audio duration so the car arrives at the destination
   // roughly when all audio has played.
   const simSpeedRef = useRef(0);
+
+  // Keep simStateRef in sync with simState
+  useEffect(() => { simStateRef.current = simState; }, [simState]);
 
   // Fetch a Google Places photo for the currently-narrating POI. Falls back
   // to a static map image if the POI has no photo on file. Cached by place_id.
@@ -770,8 +776,11 @@ export default function TourScreen() {
           // POI into playback as soon as its audio_url populates.
           pendingAudioRef.current.add(poi.id);
           console.log(`[Sim] ⏳ PENDING audio for "${poi.name}" — will play when ready`);
-        } else if (isPlayingPoiRef.current) {
+        } else if (isPlayingPoiRef.current || simStateRef.current === "welcome") {
+          // Queue if another POI is playing OR welcome audio is still going.
+          // The welcome onFinish handler drains the queue once it completes.
           poiQueueRef.current.push(poi);
+          console.log(`[Sim] ⏳ QUEUED "${poi.name}" (welcome/POI in progress)`);
         } else {
           playPoiAudio(poi);
         }
@@ -954,6 +963,13 @@ export default function TourScreen() {
       await playSound(route.welcome_audio_url, () => {
         try { bgMusicRef.current?.setVolumeAsync(0.4); } catch {}
         setSimState("navigating");
+        // Drain any POIs that queued up while the welcome was playing.
+        // Without this, an early POI would just sit in the queue forever.
+        const next = poiQueueRef.current.shift();
+        if (next) {
+          console.log(`[Sim] ▶ Welcome done — playing queued "${next.name}"`);
+          setTimeout(() => playPoiAudio(next), POI_GAP_MS);
+        }
       }, true);
     } else {
       setSimState("navigating");
@@ -1073,6 +1089,8 @@ export default function TourScreen() {
         style={styles.map}
         onMapViewControllerCreated={onMapViewControllerCreated}
         mapId="da9e1e4ff9cfa0ff3017deab"
+        myLocationEnabled={false}
+        myLocationButtonEnabled={false}
         initialCameraPosition={{
           target: { lat: route?.origin_lat || 37.7749, lng: route?.origin_lng || -122.4194 },
           zoom: 12,
