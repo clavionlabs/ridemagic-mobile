@@ -20,9 +20,6 @@
           "location"
         ],
         "ITSAppUsesNonExemptEncryption": false
-      },
-      "config": {
-        "googleMapsApiKey": "AIzaSyDwdyLAWuYc6WacRQpgtPI06wxXLofg3VI"
       }
     },
     "android": {
@@ -45,12 +42,7 @@
         "android.permission.FOREGROUND_SERVICE",
         "android.permission.FOREGROUND_SERVICE_LOCATION",
         "android.permission.MODIFY_AUDIO_SETTINGS"
-      ],
-      "config": {
-        "googleMaps": {
-          "apiKey": "AIzaSyDwdyLAWuYc6WacRQpgtPI06wxXLofg3VI"
-        }
-      }
+      ]
     },
     "web": {
       "favicon": "./assets/favicon.png",

@@ -8,6 +8,9 @@ const {
 const fs = require("fs");
 const path = require("path");
 
+// Injected at build time from .env / the EAS environment; never commit the key.
+const MAPS_API_KEY = process.env.EXPO_PUBLIC_GOOGLE_MAPS_API_KEY;
+
 function withNavigationSDK(config) {
   // ─── Android: build.gradle (desugaring + maps exclude) ──
   config = withAppBuildGradle(config, (config) => {
@@ -65,7 +68,7 @@ function withNavigationSDK(config) {
         mainApp["meta-data"].push({
           $: {
             "android:name": "com.google.android.geo.API_KEY",
-            "android:value": "AIzaSyDwdyLAWuYc6WacRQpgtPI06wxXLofg3VI",
+            "android:value": MAPS_API_KEY,
           },
         });
       }
@@ -164,7 +167,7 @@ function withNavigationSDK(config) {
   // we set it explicitly here as a belt-and-suspenders measure.)
   config = withInfoPlist(config, (config) => {
     if (!config.modResults.GMSApiKey) {
-      config.modResults.GMSApiKey = "AIzaSyDwdyLAWuYc6WacRQpgtPI06wxXLofg3VI";
+      config.modResults.GMSApiKey = MAPS_API_KEY;
     }
     return config;
   });
